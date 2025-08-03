@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY main.py .
 
 # Copy policy document (comment this line if you don't have policy.pdf)
-# COPY policy.pdf .
+COPY policy.pdf .
 
 # Expose port
 EXPOSE 8000
