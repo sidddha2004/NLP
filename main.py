@@ -321,21 +321,38 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 # Initialize services once at startup for Railway
-print("Initializing services...")
-gemini_model = initialize_services()
-pc, index = init_pinecone()
-
-# Initialize policy document if available
-initialize_policy_document()
-
-print("All services initialized successfully!")
+try:
+    print("Initializing services...")
+    gemini_model = initialize_services()
+    print("Gemini initialized successfully")
+    
+    pc, index = init_pinecone()
+    print("Pinecone initialized successfully")
+    
+    # Initialize policy document if available
+    initialize_policy_document()
+    
+    print("All services initialized successfully!")
+except Exception as e:
+    print(f"STARTUP ERROR: {e}")
+    import traceback
+    traceback.print_exc()
+    # Continue anyway to allow health checks
+    gemini_model = None
+    index = None
 
 # API endpoints
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
-    # Use pre-initialized services (Railway pattern)
+    # Check if services are initialized
     global gemini_model, pc, index
+    
+    if not gemini_model or not index:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Services not properly initialized. Check logs for details."
+        )
     
     answers = []
     
@@ -357,7 +374,12 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "Insurance Policy RAG API with Gemini is running"}
+    return {
+        "status": "healthy", 
+        "message": "Insurance Policy RAG API with Gemini is running",
+        "gemini_initialized": gemini_model is not None,
+        "index_initialized": index is not None
+    }
 
 @app.get("/info")
 async def get_info():
