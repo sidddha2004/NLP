@@ -59,8 +59,42 @@ def initialize_services():
             
             # Configure Gemini
             genai.configure(api_key=api_key)
-            gemini_model = genai.GenerativeModel('gemini-pro')
-            logger.info("Gemini model initialized successfully")
+            
+            # Try different model names in order of preference
+            model_names = [
+                'gemini-1.5-flash',
+                'gemini-1.5-pro', 
+                'gemini-pro-latest',
+                'gemini-1.0-pro',
+                'gemini-pro'
+            ]
+            
+            gemini_model = None
+            for model_name in model_names:
+                try:
+                    logger.info(f"Trying to initialize model: {model_name}")
+                    gemini_model = genai.GenerativeModel(model_name)
+                    
+                    # Test the model with a simple request
+                    test_response = gemini_model.generate_content("Hello")
+                    logger.info(f"✓ Successfully initialized model: {model_name}")
+                    break
+                    
+                except Exception as model_error:
+                    logger.warning(f"Failed to initialize {model_name}: {model_error}")
+                    continue
+            
+            if gemini_model is None:
+                # List available models for debugging
+                try:
+                    available_models = genai.list_models()
+                    model_list = [model.name for model in available_models]
+                    logger.error(f"Available models: {model_list}")
+                    raise ValueError(f"No working Gemini model found. Available models: {model_list}")
+                except Exception as list_error:
+                    logger.error(f"Could not list available models: {list_error}")
+                    raise ValueError("No working Gemini model found and could not list available models")
+            
             initialization_status["gemini"] = True
         
         return gemini_model
@@ -257,7 +291,19 @@ def get_gemini_embedding(text: str, gemini_model) -> List[float]:
     try:
         # Use Gemini to generate a semantic representation
         prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
-        response = gemini_model.generate_content(prompt)
+        
+        # Add safety settings and generation config
+        generation_config = {
+            "temperature": 0.1,
+            "top_p": 0.8,
+            "top_k": 40,
+            "max_output_tokens": 1024,
+        }
+        
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
         keywords = response.text.strip()
         
         # Convert keywords to embedding using simple hashing
@@ -293,7 +339,18 @@ Answer:
 """
     
     try:
-        response = gemini_model.generate_content(prompt)
+        # Add generation config for better control
+        generation_config = {
+            "temperature": 0.1,
+            "top_p": 0.8,
+            "top_k": 40,
+            "max_output_tokens": 2048,
+        }
+        
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
         return response.text
     except Exception as e:
         logger.error(f"Error generating Gemini response: {e}")
@@ -358,9 +415,18 @@ def initialize_policy_document():
     try:
         policy_file = "policy.pdf"
         
+        # Debug: List all files in current directory
+        logger.info(f"Current working directory: {os.getcwd()}")
+        logger.info(f"Files in current directory: {os.listdir('.')}")
+        
         if not os.path.exists(policy_file):
-            logger.warning(f"Policy file {policy_file} not found. Skipping document initialization.")
+            logger.error(f"Policy file {policy_file} not found in {os.getcwd()}")
+            logger.error(f"Available files: {os.listdir('.')}")
             return
+        
+        # Check file permissions and size
+        file_stat = os.stat(policy_file)
+        logger.info(f"Policy file found - Size: {file_stat.st_size} bytes, Permissions: {oct(file_stat.st_mode)}")
         
         logger.info(f"Loading policy document: {policy_file}")
         
