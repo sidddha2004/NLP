@@ -150,50 +150,67 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
 
 # Simple embedding function using text hashing (no ML dependencies)
 def get_simple_embedding(text: str) -> List[float]:
-    """Create a simple embedding using text hashing and basic features"""
+    """Create a simple embedding using text hashing and basic features - EXACTLY 512 dimensions"""
     try:
         # Normalize text
         text = text.lower().strip()
-        
-        # Create multiple hash-based features
         embeddings = []
         
-        # Hash-based features (first 256 dimensions)
-        for i in range(8):
+        # Method 1: Hash-based features (256 dimensions)
+        for i in range(16):  # 16 hash iterations
             hash_obj = hashlib.md5(f"{text}_{i}".encode())
             hash_bytes = hash_obj.digest()
-            # Convert to normalized floats
-            for j in range(0, len(hash_bytes), 4):
+            # Each MD5 gives 16 bytes = 16 values
+            for byte_val in hash_bytes:
                 if len(embeddings) < 256:
-                    val = int.from_bytes(hash_bytes[j:j+4], byteorder='big', signed=False)
-                    normalized_val = (val / (2**32 - 1)) * 2 - 1  # Normalize to [-1, 1]
+                    normalized_val = (byte_val / 255.0) * 2 - 1  # Normalize to [-1, 1]
                     embeddings.append(normalized_val)
         
-        # Simple statistical features (remaining 256 dimensions)
+        # Method 2: Word-based features (256 dimensions)
         words = text.split()
+        word_features = []
         
-        # Add basic text statistics
-        features = [
+        # Basic text statistics (first 10 features)
+        word_features.extend([
             len(text) / 1000.0,  # Text length
             len(words) / 100.0,  # Word count
             sum(len(word) for word in words) / max(len(words), 1) / 10.0,  # Avg word length
             len(set(words)) / max(len(words), 1),  # Unique word ratio
-        ]
+            text.count(' ') / max(len(text), 1),  # Space ratio
+            text.count('.') / max(len(text), 1),  # Period ratio
+            text.count(',') / max(len(text), 1),  # Comma ratio
+            sum(1 for c in text if c.isupper()) / max(len(text), 1),  # Uppercase ratio
+            sum(1 for c in text if c.isdigit()) / max(len(text), 1),  # Digit ratio
+            len([w for w in words if len(w) > 5]) / max(len(words), 1)  # Long word ratio
+        ])
         
-        # Pad with word-based hashes
-        for word in words[:252]:  # Take first 252 words
-            word_hash = hash(word) % 10000
-            features.append(word_hash / 10000.0)
+        # Hash each word to create remaining features (246 more features)
+        for i in range(246):
+            if i < len(words):
+                word_hash = hash(f"{words[i]}_{i}") % 10000
+                word_features.append(word_hash / 10000.0)
+            else:
+                # If we run out of words, use character-based hashes
+                if i < len(text):
+                    char_hash = hash(f"{text[i]}_{i}") % 10000
+                    word_features.append(char_hash / 10000.0)
+                else:
+                    word_features.append(0.0)
         
-        # Pad to exactly 256 features
-        while len(features) < 256:
-            features.append(0.0)
+        # Ensure exactly 256 word features
+        word_features = word_features[:256]
+        while len(word_features) < 256:
+            word_features.append(0.0)
         
-        # Combine hash and statistical features
-        embeddings.extend(features[:256])
+        # Combine both feature sets
+        embeddings.extend(word_features)
         
-        # Ensure exactly 512 dimensions
-        return embeddings[:512]
+        # Final check: ensure exactly 512 dimensions
+        embeddings = embeddings[:512]
+        while len(embeddings) < 512:
+            embeddings.append(0.0)
+            
+        return embeddings
         
     except Exception as e:
         print(f"Error creating embedding: {e}")
@@ -202,7 +219,7 @@ def get_simple_embedding(text: str) -> List[float]:
 
 # Alternative: Use Gemini for embeddings (API-based, no local ML dependencies)
 def get_gemini_embedding(text: str, gemini_model) -> List[float]:
-    """Use Gemini to create embeddings via API"""
+    """Use Gemini to create embeddings via API - EXACTLY 512 dimensions"""
     try:
         # Use Gemini to generate a semantic representation
         prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
@@ -210,7 +227,18 @@ def get_gemini_embedding(text: str, gemini_model) -> List[float]:
         keywords = response.text.strip()
         
         # Convert keywords to embedding using simple hashing
-        return get_simple_embedding(keywords)
+        embedding = get_simple_embedding(keywords)
+        
+        # Double check dimensions
+        if len(embedding) != 512:
+            print(f"Warning: Gemini embedding has {len(embedding)} dimensions, expected 512")
+            # Pad or truncate to exactly 512
+            if len(embedding) < 512:
+                embedding.extend([0.0] * (512 - len(embedding)))
+            else:
+                embedding = embedding[:512]
+        
+        return embedding
         
     except Exception as e:
         print(f"Error getting Gemini embedding: {e}")
