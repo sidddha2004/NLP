@@ -27,20 +27,25 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY main.py .
 
-# Copy policy document and verify it exists
-COPY policy.pdf .
-RUN test -f policy.pdf && echo "✓ policy.pdf copied successfully" || echo "⚠ policy.pdf not found"
+# Copy policy document if it exists (make it optional)
+COPY policy.pdf* ./
+RUN if [ -f policy.pdf ]; then \
+        echo "✓ policy.pdf copied successfully"; \
+        ls -la policy.pdf; \
+    else \
+        echo "⚠ policy.pdf not found - service will start without pre-loaded document"; \
+    fi
 
-# Create a non-root user for security (optional but recommended)
+# Create a non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
-
-# Health check for Railway
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Expose port (Railway will set the PORT env var)
 EXPOSE ${PORT:-8000}
 
-# Command to run the application
-CMD ["python", "-u", "main.py"]
+# Health check with longer timeout for Railway
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=5 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+
+# Command to run the application with uvicorn directly for better Railway compatibility
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 65"]
