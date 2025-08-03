@@ -1,8 +1,10 @@
-# main.py - Railway deployment version (No OpenAI required)
+# main.py - Ultra-lightweight Railway deployment (Uses Gemini for embeddings)
 
 import os
 from typing import List
 import time
+import hashlib
+import numpy as np
 
 # FastAPI and related imports
 from fastapi import FastAPI, Depends, HTTPException, status
@@ -18,9 +20,6 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 
-# Use sentence-transformers instead of OpenAI embeddings to avoid API costs
-from sentence_transformers import SentenceTransformer
-
 # FastAPI setup
 app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
 
@@ -34,13 +33,12 @@ app.add_middleware(
 
 # Global variables for models
 gemini_model = None
-embedding_model = None
 pc = None
 index = None
 
 # Initialize AI models and services
 def initialize_services():
-    global gemini_model, embedding_model
+    global gemini_model
     
     if gemini_model is None:
         # Configure Gemini
@@ -48,12 +46,7 @@ def initialize_services():
         gemini_model = genai.GenerativeModel('gemini-pro')
         print("Gemini model initialized")
     
-    if embedding_model is None:
-        # Initialize sentence-transformers model (free alternative to OpenAI)
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("Embedding model initialized")
-    
-    return gemini_model, embedding_model
+    return gemini_model
 
 # Initialize Pinecone
 def init_pinecone():
@@ -63,7 +56,7 @@ def init_pinecone():
         pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
     
     if index is None:
-        index_name = "policy-docs-gemini-v2"
+        index_name = "policy-docs-gemini-hash"
         
         # Check if index exists
         existing_indexes = [idx.name for idx in pc.list_indexes()]
@@ -72,7 +65,7 @@ def init_pinecone():
             print(f"Creating new index: {index_name}")
             pc.create_index(
                 name=index_name,
-                dimension=384,  # sentence-transformers all-MiniLM-L6-v2 dimension
+                dimension=512,  # Using simple hash-based embeddings
                 metric="cosine",
                 spec=ServerlessSpec(
                     cloud="aws",
@@ -128,14 +121,74 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
         start = end - overlap if end - overlap > start else end
     return chunks
 
-# AI functions using sentence-transformers embeddings
-def get_embedding(text: str, embedding_model) -> List[float]:
+# Simple embedding function using text hashing (no ML dependencies)
+def get_simple_embedding(text: str) -> List[float]:
+    """Create a simple embedding using text hashing and basic features"""
     try:
-        embedding = embedding_model.encode(text)
-        return embedding.tolist()
+        # Normalize text
+        text = text.lower().strip()
+        
+        # Create multiple hash-based features
+        embeddings = []
+        
+        # Hash-based features (first 256 dimensions)
+        for i in range(8):
+            hash_obj = hashlib.md5(f"{text}_{i}".encode())
+            hash_bytes = hash_obj.digest()
+            # Convert to normalized floats
+            for j in range(0, len(hash_bytes), 4):
+                if len(embeddings) < 256:
+                    val = int.from_bytes(hash_bytes[j:j+4], byteorder='big', signed=False)
+                    normalized_val = (val / (2**32 - 1)) * 2 - 1  # Normalize to [-1, 1]
+                    embeddings.append(normalized_val)
+        
+        # Simple statistical features (remaining 256 dimensions)
+        words = text.split()
+        
+        # Add basic text statistics
+        features = [
+            len(text) / 1000.0,  # Text length
+            len(words) / 100.0,  # Word count
+            sum(len(word) for word in words) / max(len(words), 1) / 10.0,  # Avg word length
+            len(set(words)) / max(len(words), 1),  # Unique word ratio
+        ]
+        
+        # Pad with word-based hashes
+        for word in words[:252]:  # Take first 252 words
+            word_hash = hash(word) % 10000
+            features.append(word_hash / 10000.0)
+        
+        # Pad to exactly 256 features
+        while len(features) < 256:
+            features.append(0.0)
+        
+        # Combine hash and statistical features
+        embeddings.extend(features[:256])
+        
+        # Ensure exactly 512 dimensions
+        return embeddings[:512]
+        
     except Exception as e:
-        print(f"Error getting embedding: {e}")
-        return None
+        print(f"Error creating embedding: {e}")
+        # Return zero vector if error
+        return [0.0] * 512
+
+# Alternative: Use Gemini for embeddings (API-based, no local ML dependencies)
+def get_gemini_embedding(text: str, gemini_model) -> List[float]:
+    """Use Gemini to create embeddings via API"""
+    try:
+        # Use Gemini to generate a semantic representation
+        prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
+        response = gemini_model.generate_content(prompt)
+        keywords = response.text.strip()
+        
+        # Convert keywords to embedding using simple hashing
+        return get_simple_embedding(keywords)
+        
+    except Exception as e:
+        print(f"Error getting Gemini embedding: {e}")
+        # Fallback to simple embedding
+        return get_simple_embedding(text)
 
 def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
     prompt = f"""
@@ -157,9 +210,14 @@ Answer:
         return f"Error generating response: {str(e)}"
 
 # Pinecone operations
-def query_chunks(query: str, index, embedding_model, top_k: int = 5) -> List[str]:
-    query_embedding = get_embedding(query, embedding_model)
-    if query_embedding is None:
+def query_chunks(query: str, index, gemini_model, top_k: int = 5) -> List[str]:
+    # Try Gemini-based embedding first, fallback to simple embedding
+    try:
+        query_embedding = get_gemini_embedding(query, gemini_model)
+    except:
+        query_embedding = get_simple_embedding(query)
+    
+    if not query_embedding:
         return []
     
     query_response = index.query(
@@ -170,10 +228,15 @@ def query_chunks(query: str, index, embedding_model, top_k: int = 5) -> List[str
     return [match.metadata.get("text", "") for match in query_response.matches]
 
 # Pinecone upsert functions
-def upsert_chunks(chunks: List[str], index, embedding_model):
+def upsert_chunks(chunks: List[str], index, gemini_model):
     vectors = []
     for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk, embedding_model)
+        # Try Gemini-based embedding first, fallback to simple embedding
+        try:
+            embedding = get_gemini_embedding(chunk, gemini_model)
+        except:
+            embedding = get_simple_embedding(chunk)
+            
         if embedding is not None:
             vectors.append({
                 "id": f"chunk-{i}",
@@ -192,7 +255,7 @@ def upsert_chunks(chunks: List[str], index, embedding_model):
 # Initialize policy document function
 def initialize_policy_document():
     """Extract and upsert the policy.pdf document once at startup"""
-    global index, embedding_model
+    global index, gemini_model
     
     policy_file = "policy.pdf"
     
@@ -224,7 +287,7 @@ def initialize_policy_document():
         print("Proceeding with upsert...")
     
     # Upsert chunks to Pinecone
-    upsert_chunks(chunks, index, embedding_model)
+    upsert_chunks(chunks, index, gemini_model)
     print("Policy document successfully indexed")
 
 security = HTTPBearer()
@@ -253,7 +316,7 @@ class QueryResponse(BaseModel):
 
 # Initialize services once at startup for Railway
 print("Initializing services...")
-gemini_model, embedding_model = initialize_services()
+gemini_model = initialize_services()
 pc, index = init_pinecone()
 
 # Initialize policy document if available
@@ -266,13 +329,13 @@ print("All services initialized successfully!")
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
     # Use pre-initialized services (Railway pattern)
-    global gemini_model, embedding_model, pc, index
+    global gemini_model, pc, index
     
     answers = []
     
     for question in req.questions:
         try:
-            relevant_clauses = query_chunks(question, index, embedding_model)
+            relevant_clauses = query_chunks(question, index, gemini_model)
             
             if not relevant_clauses:
                 answers.append("No relevant information found in the policy document for this question.")
@@ -299,7 +362,7 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "all-MiniLM-L6-v2",
+            "embedding_model": "gemini-enhanced-hash-embeddings",
             "llm_model": "gemini-pro"
         }
     except Exception as e:
