@@ -59,42 +59,8 @@ def initialize_services():
             
             # Configure Gemini
             genai.configure(api_key=api_key)
-            
-            # Try different model names in order of preference
-            model_names = [
-                'gemini-1.5-flash',
-                'gemini-1.5-pro', 
-                'gemini-pro-latest',
-                'gemini-1.0-pro',
-                'gemini-pro'
-            ]
-            
-            gemini_model = None
-            for model_name in model_names:
-                try:
-                    logger.info(f"Trying to initialize model: {model_name}")
-                    gemini_model = genai.GenerativeModel(model_name)
-                    
-                    # Test the model with a simple request
-                    test_response = gemini_model.generate_content("Hello")
-                    logger.info(f"✓ Successfully initialized model: {model_name}")
-                    break
-                    
-                except Exception as model_error:
-                    logger.warning(f"Failed to initialize {model_name}: {model_error}")
-                    continue
-            
-            if gemini_model is None:
-                # List available models for debugging
-                try:
-                    available_models = genai.list_models()
-                    model_list = [model.name for model in available_models]
-                    logger.error(f"Available models: {model_list}")
-                    raise ValueError(f"No working Gemini model found. Available models: {model_list}")
-                except Exception as list_error:
-                    logger.error(f"Could not list available models: {list_error}")
-                    raise ValueError("No working Gemini model found and could not list available models")
-            
+            gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+            logger.info("Gemini model initialized successfully")
             initialization_status["gemini"] = True
         
         return gemini_model
@@ -291,19 +257,7 @@ def get_gemini_embedding(text: str, gemini_model) -> List[float]:
     try:
         # Use Gemini to generate a semantic representation
         prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
-        
-        # Add safety settings and generation config
-        generation_config = {
-            "temperature": 0.1,
-            "top_p": 0.8,
-            "top_k": 40,
-            "max_output_tokens": 1024,
-        }
-        
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
+        response = gemini_model.generate_content(prompt)
         keywords = response.text.strip()
         
         # Convert keywords to embedding using simple hashing
@@ -339,18 +293,7 @@ Answer:
 """
     
     try:
-        # Add generation config for better control
-        generation_config = {
-            "temperature": 0.1,
-            "top_p": 0.8,
-            "top_k": 40,
-            "max_output_tokens": 2048,
-        }
-        
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
+        response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
         logger.error(f"Error generating Gemini response: {e}")
