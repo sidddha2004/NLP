@@ -104,15 +104,18 @@ async def initialize_openai():
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
         
-        openai_client = openai.OpenAI(api_key=api_key)
+        # Use legacy OpenAI client (v0.28.x) - more stable
+        openai.api_key = api_key
+        openai_client = openai
         
-        # Quick test
-        test_response = openai_client.chat.completions.create(
+        # Test the client with a simple request
+        test_response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "Hello"}],
             max_tokens=5
         )
         
+        logger.info("✓ OpenAI client initialized and tested successfully")
         initialization_status["openai"] = True
         
     except Exception as e:
@@ -312,7 +315,8 @@ def get_simple_embedding(text: str) -> List[float]:
 def get_openai_embedding(text: str, openai_client) -> List[float]:
     """Use OpenAI to create embeddings via API"""
     try:
-        response = openai_client.chat.completions.create(
+        # Using legacy OpenAI client (v0.28.x)
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{
                 "role": "user", 
@@ -321,7 +325,7 @@ def get_openai_embedding(text: str, openai_client) -> List[float]:
             max_tokens=150,
             temperature=0.1
         )
-        keywords = response.choices[0].message.content.strip()
+        keywords = response['choices'][0]['message']['content'].strip()
         embedding = get_simple_embedding(keywords)
         
         if len(embedding) != 512:
@@ -350,13 +354,15 @@ Answer:
 """
     
     try:
-        response = openai_client.chat.completions.create(
+        # Using legacy OpenAI client (v0.28.x)
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000,
             temperature=0.1
         )
-        return response.choices[0].message.content
+        return response['choices'][0]['message']['content']
+            
     except Exception as e:
         logger.error(f"Error generating OpenAI response: {e}")
         return f"Error generating response: {str(e)}"
