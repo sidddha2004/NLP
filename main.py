@@ -295,15 +295,21 @@ security = HTTPBearer()
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     expected_token = os.getenv("API_BEARER_TOKEN")
+    
+    # Debug logging
+    print(f"DEBUG: Received token: {token}")
+    print(f"DEBUG: Expected token: {expected_token}")
+    print(f"DEBUG: All env vars: {dict(os.environ)}")
+    
     if not expected_token:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="API_BEARER_TOKEN not configured"
+            detail=f"API_BEARER_TOKEN not configured. Available env vars: {list(os.environ.keys())}"
         )
     if token != expected_token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Invalid or missing authorization token"
+            detail=f"Invalid token. Expected: {expected_token}, Got: {token}"
         )
     return True
 
