@@ -10,4 +10,5 @@ requests==2.31.0
 numpy==1.24.3
 setuptools
 wheel
-google-generativeai==0.7.2
+
+
