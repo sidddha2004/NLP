@@ -1,4 +1,4 @@
-# main.py - Fixed Railway deployment for Insurance Policy RAG API
+# main.py - Railway-optimized Insurance Policy RAG API
 
 import os
 from typing import List
@@ -6,6 +6,7 @@ import time
 import hashlib
 import traceback
 import logging
+from contextlib import asynccontextmanager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -25,8 +26,37 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 import openai
 
-# FastAPI setup
-app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
+# Global variables for models
+openai_client = None
+pc = None
+index = None
+initialization_status = {
+    "openai": False,
+    "pinecone": False,
+    "document": False,
+    "error": None,
+    "startup_complete": False
+}
+
+# Startup and shutdown logic
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("=== RAILWAY STARTUP: Initializing services ===")
+    await startup_services()
+    logger.info("=== RAILWAY STARTUP COMPLETE ===")
+    
+    yield
+    
+    # Shutdown
+    logger.info("=== RAILWAY SHUTDOWN ===")
+
+# FastAPI setup with lifespan
+app = FastAPI(
+    title="Insurance Policy RAG API with OpenAI", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,120 +66,138 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for models
-openai_client = None
-pc = None
-index = None
-initialization_status = {
-    "openai": False,
-    "pinecone": False,
-    "document": False,
-    "error": None
-}
+async def startup_services():
+    global openai_client, pc, index, initialization_status
+    
+    try:
+        # Quick health check endpoint should work immediately
+        initialization_status["startup_complete"] = True
+        
+        # Initialize OpenAI (fast)
+        await initialize_openai()
+        logger.info("✓ OpenAI initialized")
+        
+        # Initialize Pinecone (can be slow)
+        await initialize_pinecone()
+        logger.info("✓ Pinecone initialized")
+        
+        # Initialize document (slowest - make it non-blocking)
+        try:
+            await initialize_document()
+            logger.info("✓ Document initialized")
+        except Exception as doc_error:
+            logger.warning(f"⚠ Document initialization failed: {doc_error}")
+            logger.info("Service will continue without pre-loaded document")
+            initialization_status["error"] = f"Document init failed: {str(doc_error)}"
+        
+    except Exception as e:
+        logger.error(f"❌ STARTUP ERROR: {e}")
+        logger.error(traceback.format_exc())
+        initialization_status["error"] = str(e)
+        # Don't raise - let the service start anyway for health checks
 
-# Initialize AI models and services
-def initialize_services():
+async def initialize_openai():
     global openai_client, initialization_status
     
     try:
-        if openai_client is None:
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable not set")
-            
-            # Initialize OpenAI client
-            openai_client = openai.OpenAI(api_key=api_key)
-            
-            # Test the client with a simple request
-            try:
-                test_response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": "Hello"}],
-                    max_tokens=10
-                )
-                logger.info("✓ OpenAI client initialized and tested successfully")
-                initialization_status["openai"] = True
-            except Exception as test_error:
-                logger.error(f"OpenAI test failed: {test_error}")
-                raise test_error
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
         
-        return openai_client
+        openai_client = openai.OpenAI(api_key=api_key)
+        
+        # Quick test
+        test_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=5
+        )
+        
+        initialization_status["openai"] = True
+        
     except Exception as e:
         logger.error(f"Failed to initialize OpenAI: {e}")
         initialization_status["error"] = str(e)
         raise e
 
-# Initialize Pinecone
-def init_pinecone():
+async def initialize_pinecone():
     global pc, index, initialization_status
     
     try:
-        logger.info("🔧 Initializing Pinecone...")
-        if pc is None:
-            api_key = os.getenv("PINECONE_API_KEY")
-            if not api_key:
-                raise ValueError("PINECONE_API_KEY environment variable not set")
-            
-            pc = Pinecone(api_key=api_key)
-            logger.info("✓ Pinecone client initialized")
+        api_key = os.getenv("PINECONE_API_KEY")
+        if not api_key:
+            raise ValueError("PINECONE_API_KEY environment variable not set")
         
-        if index is None:
-            index_name = "policy-docs-gemini-hash"
-            
-            # Check if index exists
-            try:
-                existing_indexes = [idx.name for idx in pc.list_indexes()]
-                logger.info(f"📋 Found existing indexes: {existing_indexes}")
-                
-                if index_name not in existing_indexes:
-                    logger.info(f"🏗 Creating new index: {index_name}")
-                    pc.create_index(
-                        name=index_name,
-                        dimension=512,  # Using simple hash-based embeddings
-                        metric="cosine",
-                        spec=ServerlessSpec(
-                            cloud="aws",
-                            region="us-east-1"
-                        )
-                    )
-                    logger.info(f"✓ Created new index: {index_name}")
-                    
-                    # Wait for index to be ready
-                    logger.info("⏳ Waiting for index to be ready...")
-                    max_retries = 60
-                    retry_count = 0
-                    while retry_count < max_retries:
-                        try:
-                            if pc.describe_index(index_name).status['ready']:
-                                break
-                        except Exception as wait_error:
-                            logger.warning(f"Waiting for index, attempt {retry_count}: {wait_error}")
-                        time.sleep(2)
-                        retry_count += 1
-                        if retry_count % 10 == 0:
-                            logger.info(f"Still waiting... ({retry_count}/{max_retries})")
-                    
-                    if retry_count >= max_retries:
-                        raise Exception("Index creation timeout")
-                    logger.info("✓ Index is ready!")
-                else:
-                    logger.info(f"✓ Using existing index: {index_name}")
-                
-                index = pc.Index(index_name)
-                logger.info("✓ Connected to index")
-                initialization_status["pinecone"] = True
-                
-            except Exception as e:
-                logger.error(f"❌ Error with Pinecone index: {e}")
-                raise e
+        pc = Pinecone(api_key=api_key)
+        index_name = "policy-docs-gemini-hash"
         
-        return pc, index
+        # Check existing indexes
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        
+        if index_name not in existing_indexes:
+            logger.info(f"Creating index: {index_name}")
+            pc.create_index(
+                name=index_name,
+                dimension=512,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+            
+            # Wait for index to be ready (with timeout)
+            max_wait = 30  # Reduced wait time
+            waited = 0
+            while waited < max_wait:
+                try:
+                    if pc.describe_index(index_name).status['ready']:
+                        break
+                except:
+                    pass
+                time.sleep(2)
+                waited += 2
+            
+            if waited >= max_wait:
+                logger.warning("Index creation timeout - will retry later")
+        
+        index = pc.Index(index_name)
+        initialization_status["pinecone"] = True
+        
     except Exception as e:
         logger.error(f"Failed to initialize Pinecone: {e}")
         initialization_status["error"] = str(e)
         raise e
 
-# Text extraction functions
+async def initialize_document():
+    global index, openai_client, initialization_status
+    
+    try:
+        policy_file = "policy.pdf"
+        
+        if not os.path.exists(policy_file):
+            logger.warning(f"Policy file {policy_file} not found")
+            return
+        
+        # Extract and process document
+        full_text = extract_text(policy_file)
+        chunks = chunk_text(full_text)
+        
+        # Clear existing vectors
+        try:
+            stats = index.describe_index_stats()
+            if stats.total_vector_count > 0:
+                index.delete(delete_all=True)
+                time.sleep(2)
+        except:
+            pass
+        
+        # Upsert chunks
+        upsert_chunks(chunks, index, openai_client)
+        initialization_status["document"] = True
+        
+    except Exception as e:
+        logger.error(f"Error initializing document: {e}")
+        raise e
+
+# Text extraction functions (unchanged)
 def extract_text_from_pdf(pdf_path: str) -> str:
     try:
         with open(pdf_path, "rb") as f:
@@ -181,7 +229,6 @@ def extract_text(file_path: str) -> str:
     else:
         raise ValueError(f"Unsupported document format: {ext}")
 
-# Text chunking
 def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
     chunks = []
     start = 0
@@ -192,64 +239,58 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
         start = end - overlap if end - overlap > start else end
     return chunks
 
-# Simple embedding function using text hashing (no ML dependencies)
 def get_simple_embedding(text: str) -> List[float]:
-    """Create a simple embedding using text hashing and basic features - EXACTLY 512 dimensions"""
+    """Create a simple embedding using text hashing - EXACTLY 512 dimensions"""
     try:
-        # Normalize text
         text = text.lower().strip()
         embeddings = []
         
-        # Method 1: Hash-based features (256 dimensions)
-        for i in range(16):  # 16 hash iterations
+        # Hash-based features (256 dimensions)
+        for i in range(16):
             hash_obj = hashlib.md5(f"{text}_{i}".encode())
             hash_bytes = hash_obj.digest()
-            # Each MD5 gives 16 bytes = 16 values
             for byte_val in hash_bytes:
                 if len(embeddings) < 256:
-                    normalized_val = (byte_val / 255.0) * 2 - 1  # Normalize to [-1, 1]
+                    normalized_val = (byte_val / 255.0) * 2 - 1
                     embeddings.append(normalized_val)
         
-        # Method 2: Word-based features (256 dimensions)
+        # Word-based features (256 dimensions)
         words = text.split()
         word_features = []
         
-        # Basic text statistics (first 10 features)
+        # Basic text statistics
         word_features.extend([
-            len(text) / 1000.0,  # Text length
-            len(words) / 100.0,  # Word count
-            sum(len(word) for word in words) / max(len(words), 1) / 10.0,  # Avg word length
-            len(set(words)) / max(len(words), 1),  # Unique word ratio
-            text.count(' ') / max(len(text), 1),  # Space ratio
-            text.count('.') / max(len(text), 1),  # Period ratio
-            text.count(',') / max(len(text), 1),  # Comma ratio
-            sum(1 for c in text if c.isupper()) / max(len(text), 1),  # Uppercase ratio
-            sum(1 for c in text if c.isdigit()) / max(len(text), 1),  # Digit ratio
-            len([w for w in words if len(w) > 5]) / max(len(words), 1)  # Long word ratio
+            len(text) / 1000.0,
+            len(words) / 100.0,
+            sum(len(word) for word in words) / max(len(words), 1) / 10.0,
+            len(set(words)) / max(len(words), 1),
+            text.count(' ') / max(len(text), 1),
+            text.count('.') / max(len(text), 1),
+            text.count(',') / max(len(text), 1),
+            sum(1 for c in text if c.isupper()) / max(len(text), 1),
+            sum(1 for c in text if c.isdigit()) / max(len(text), 1),
+            len([w for w in words if len(w) > 5]) / max(len(words), 1)
         ])
         
-        # Hash each word to create remaining features (246 more features)
+        # Fill remaining features
         for i in range(246):
             if i < len(words):
                 word_hash = hash(f"{words[i]}_{i}") % 10000
                 word_features.append(word_hash / 10000.0)
             else:
-                # If we run out of words, use character-based hashes
                 if i < len(text):
                     char_hash = hash(f"{text[i]}_{i}") % 10000
                     word_features.append(char_hash / 10000.0)
                 else:
                     word_features.append(0.0)
         
-        # Ensure exactly 256 word features
         word_features = word_features[:256]
         while len(word_features) < 256:
             word_features.append(0.0)
         
-        # Combine both feature sets
         embeddings.extend(word_features)
         
-        # Final check: ensure exactly 512 dimensions
+        # Ensure exactly 512 dimensions
         embeddings = embeddings[:512]
         while len(embeddings) < 512:
             embeddings.append(0.0)
@@ -258,14 +299,11 @@ def get_simple_embedding(text: str) -> List[float]:
         
     except Exception as e:
         logger.error(f"Error creating embedding: {e}")
-        # Return zero vector if error
         return [0.0] * 512
 
-# Alternative: Use OpenAI for embeddings (API-based, no local ML dependencies)
 def get_openai_embedding(text: str, openai_client) -> List[float]:
-    """Use OpenAI to create embeddings via API - EXACTLY 512 dimensions"""
+    """Use OpenAI to create embeddings via API"""
     try:
-        # Use OpenAI to generate a semantic summary
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{
@@ -276,14 +314,9 @@ def get_openai_embedding(text: str, openai_client) -> List[float]:
             temperature=0.1
         )
         keywords = response.choices[0].message.content.strip()
-        
-        # Convert keywords to embedding using simple hashing
         embedding = get_simple_embedding(keywords)
         
-        # Double check dimensions
         if len(embedding) != 512:
-            logger.warning(f"OpenAI embedding has {len(embedding)} dimensions, expected 512")
-            # Pad or truncate to exactly 512
             if len(embedding) < 512:
                 embedding.extend([0.0] * (512 - len(embedding)))
             else:
@@ -293,7 +326,6 @@ def get_openai_embedding(text: str, openai_client) -> List[float]:
         
     except Exception as e:
         logger.error(f"Error getting OpenAI embedding: {e}")
-        # Fallback to simple embedding
         return get_simple_embedding(text)
 
 def query_openai(question: str, context_clauses: List[str], openai_client) -> str:
@@ -321,10 +353,8 @@ Answer:
         logger.error(f"Error generating OpenAI response: {e}")
         return f"Error generating response: {str(e)}"
 
-# Pinecone operations
 def query_chunks(query: str, index, openai_client, top_k: int = 5) -> List[str]:
     try:
-        # Try OpenAI-based embedding first, fallback to simple embedding
         try:
             query_embedding = get_openai_embedding(query, openai_client)
         except:
@@ -343,12 +373,10 @@ def query_chunks(query: str, index, openai_client, top_k: int = 5) -> List[str]:
         logger.error(f"Error querying chunks: {e}")
         return []
 
-# Pinecone upsert functions
 def upsert_chunks(chunks: List[str], index, openai_client):
     try:
         vectors = []
         for i, chunk in enumerate(chunks):
-            # Try OpenAI-based embedding first, fallback to simple embedding
             try:
                 embedding = get_openai_embedding(chunk, openai_client)
             except:
@@ -356,12 +384,12 @@ def upsert_chunks(chunks: List[str], index, openai_client):
                 
             if embedding is not None:
                 vectors.append({
-                    "id": f"chunk-{i}-{int(time.time())}",  # Add timestamp to avoid ID conflicts
+                    "id": f"chunk-{i}-{int(time.time())}",
                     "values": embedding,
                     "metadata": {"text": chunk}
                 })
         
-        # Upsert in batches of 100 (Pinecone recommendation)
+        # Batch upsert
         batch_size = 100
         for i in range(0, len(vectors), batch_size):
             batch = vectors[i:i + batch_size]
@@ -372,61 +400,6 @@ def upsert_chunks(chunks: List[str], index, openai_client):
         logger.error(f"Error upserting chunks: {e}")
         raise e
 
-# Initialize policy document function
-def initialize_policy_document():
-    """Extract and upsert the policy.pdf document once at startup"""
-    global index, openai_client, initialization_status
-    
-    try:
-        policy_file = "policy.pdf"
-        
-        # Debug: List all files in current directory
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"Files in current directory: {os.listdir('.')}")
-        
-        if not os.path.exists(policy_file):
-            logger.error(f"Policy file {policy_file} not found in {os.getcwd()}")
-            logger.error(f"Available files: {os.listdir('.')}")
-            return
-        
-        # Check file permissions and size
-        file_stat = os.stat(policy_file)
-        logger.info(f"Policy file found - Size: {file_stat.st_size} bytes, Permissions: {oct(file_stat.st_mode)}")
-        
-        logger.info(f"Loading policy document: {policy_file}")
-        
-        # Extract text from the policy document
-        full_text = extract_text(policy_file)
-        logger.info(f"Extracted {len(full_text)} characters from policy document")
-        
-        # Chunk the text
-        chunks = chunk_text(full_text)
-        logger.info(f"Created {len(chunks)} chunks")
-        
-        # Check if index has any vectors before trying to delete
-        try:
-            stats = index.describe_index_stats()
-            if stats.total_vector_count > 0:
-                logger.info("Clearing existing vectors from index...")
-                index.delete(delete_all=True)
-                logger.info("Cleared existing vectors from index")
-                time.sleep(5)  # Wait a bit after clearing
-            else:
-                logger.info("Index is empty, no need to clear")
-        except Exception as e:
-            logger.warning(f"Could not check/clear index stats: {e}")
-            logger.info("Proceeding with upsert...")
-        
-        # Upsert chunks to Pinecone
-        upsert_chunks(chunks, index, openai_client)
-        logger.info("Policy document successfully indexed")
-        initialization_status["document"] = True
-        
-    except Exception as e:
-        logger.error(f"Error initializing policy document: {e}")
-        initialization_status["error"] = str(e)
-        raise e
-
 security = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -434,13 +407,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     expected_token = os.getenv("API_BEARER_TOKEN")
     
     if not expected_token:
-        logger.error("API_BEARER_TOKEN not configured")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="API_BEARER_TOKEN not configured"
         )
     if token != expected_token:
-        logger.warning(f"Invalid token received")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="Invalid authentication token"
@@ -454,47 +425,26 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# Initialize services once at startup for Railway
-@app.on_event("startup")
-async def startup_event():
-    global openai_client, pc, index, initialization_status
-    
-    logger.info("=== STARTUP: Initializing services ===")
-    
-    try:
-        # Initialize OpenAI
-        openai_client = initialize_services()
-        logger.info("✓ OpenAI initialized successfully")
-        
-        # Initialize Pinecone
-        pc, index = init_pinecone()
-        logger.info("✓ Pinecone initialized successfully")
-        
-        # Initialize policy document if available (non-blocking)
-        try:
-            initialize_policy_document()
-            logger.info("✓ Policy document initialized successfully")
-        except Exception as doc_error:
-            logger.warning(f"⚠ Policy document initialization failed: {doc_error}")
-            logger.info("Continuing without document...")
-        
-        logger.info("=== STARTUP COMPLETE ===")
-        
-    except Exception as e:
-        logger.error(f"❌ STARTUP ERROR: {e}")
-        logger.error(traceback.format_exc())
-        initialization_status["error"] = str(e)
-        logger.warning("⚠ Continuing with limited functionality...")
-
 # API endpoints
+@app.get("/health")
+async def health_check():
+    """Fast health check that always responds quickly"""
+    return {
+        "status": "healthy" if initialization_status["startup_complete"] else "starting",
+        "message": "Insurance Policy RAG API is running",
+        "initialization_status": initialization_status,
+        "environment": {
+            "port": os.environ.get("PORT", "8000"),
+            "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
+            "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
+            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
+        }
+    }
+
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
-    # Check if services are initialized
-    global openai_client, pc, index
-    
     if not openai_client or not index:
-        logger.error("Services not properly initialized")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Services not properly initialized. Status: {initialization_status}"
@@ -519,20 +469,6 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
             answers.append(f"Error processing question: {str(e)}")
     
     return QueryResponse(answers=answers)
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy", 
-        "message": "Insurance Policy RAG API with OpenAI is running",
-        "initialization_status": initialization_status,
-        "environment": {
-            "port": os.environ.get("PORT", "8000"),
-            "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
-            "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
-            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
-        }
-    }
 
 @app.get("/info")
 async def get_info():
@@ -566,8 +502,26 @@ async def root():
         }
     }
 
-# For Railway deployment - run with uvicorn
+# Railway/Docker deployment
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    logger.info(f"🚀 Starting server on port {port}")
+    logger.info(f"📁 Current directory: {os.getcwd()}")
+    logger.info(f"📋 Files in directory: {os.listdir('.')}")
+    
+    # Log environment status
+    logger.info(f"🔑 Environment check:")
+    logger.info(f"  - OPENAI_API_KEY: {'✓' if os.getenv('OPENAI_API_KEY') else '✗'}")
+    logger.info(f"  - PINECONE_API_KEY: {'✓' if os.getenv('PINECONE_API_KEY') else '✗'}")
+    logger.info(f"  - API_BEARER_TOKEN: {'✓' if os.getenv('API_BEARER_TOKEN') else '✗'}")
+    logger.info(f"  - policy.pdf: {'✓' if os.path.exists('policy.pdf') else '✗'}")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        workers=1,
+        timeout_keep_alive=65,
+        access_log=True
+    )
