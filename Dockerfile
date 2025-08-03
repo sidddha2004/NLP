@@ -13,6 +13,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 # Install system dependencies (minimal)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -23,12 +24,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code AND policy document
+# Copy application code
 COPY main.py .
-COPY policy.pdf .
+
+# Copy policy document (optional - app will work without it)
+COPY policy.pdf . || echo "No policy.pdf found, skipping..."
+
+# Create a simple healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Expose port
 EXPOSE 8000
 
-# Command to run the application
-CMD ["python", "main.py"]
+# Command to run the application with more verbose logging
+CMD ["python", "-u", "main.py"]
