@@ -1,4 +1,4 @@
-# main.py - Railway deployment version
+# main.py - Vercel deployment version
 
 import os
 from typing import List
@@ -7,8 +7,9 @@ import time
 # FastAPI and related imports
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
+from mangum import Mangum
 
 # Document processing
 import PyPDF2
@@ -19,76 +20,53 @@ from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 
+# FastAPI setup
+app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables for models
+gemini_model = None
+embedding_model = None
+pc = None
+index = None
+
 # Initialize AI models and services
 def initialize_services():
-    # Configure Gemini
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    gemini_model = genai.GenerativeModel('gemini-pro')
+    global gemini_model, embedding_model
     
-    # Use lighter embedding approach
-    return gemini_model
-
-# AI functions - Updated for lighter embeddings
-def get_embedding(text: str) -> List[float]:
-    """Simple embedding using basic text features - much lighter than sentence-transformers"""
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    import numpy as np
+    if gemini_model is None:
+        # Configure Gemini
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        gemini_model = genai.GenerativeModel('gemini-pro')
     
-    # Create a simple TF-IDF based embedding
-    # This is much lighter but still functional for basic RAG
-    vectorizer = TfidfVectorizer(max_features=384, stop_words='english')
+    if embedding_model is None:
+        # Initialize embedding model
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
     
-    # Fit on the text and transform
-    try:
-        tfidf_matrix = vectorizer.fit_transform([text])
-        embedding = tfidf_matrix.toarray()[0].tolist()
-        
-        # Pad or truncate to exactly 384 dimensions
-        if len(embedding) < 384:
-            embedding.extend([0.0] * (384 - len(embedding)))
-        else:
-            embedding = embedding[:384]
-            
-        return embedding
-    except:
-        # Fallback: return zero vector
-        return [0.0] * 384
+    return gemini_model, embedding_model
 
 # Initialize Pinecone
 def init_pinecone():
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    global pc, index
     
-    index_name = "policy-docs-gemini"
+    if pc is None:
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
     
-    # Check if index exists
-    existing_indexes = [index.name for index in pc.list_indexes()]
-    
-    if index_name not in existing_indexes:
-        print(f"Creating new index: {index_name}")
-        pc.create_index(
-            name=index_name,
-            dimension=384,
-            metric="cosine",
-            spec=ServerlessSpec(
-                cloud="aws",
-                region="us-east-1"
-            )
-        )
-        print(f"Created new index: {index_name}")
+    if index is None:
+        index_name = "policy-docs-gemini"
         
-        # Wait for index to be ready
-        print("Waiting for index to be ready...")
-        while not pc.describe_index(index_name).status['ready']:
-            time.sleep(1)
-        print("Index is ready!")
-    else:
-        print(f"Using existing index: {index_name}")
-        # Check dimensions
-        index_info = pc.describe_index(index_name)
-        if index_info.dimension != 384:
-            print(f"Deleting and recreating index with correct dimensions...")
-            pc.delete_index(index_name)
-            
+        # Check if index exists
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        
+        if index_name not in existing_indexes:
+            print(f"Creating new index: {index_name}")
             pc.create_index(
                 name=index_name,
                 dimension=384,
@@ -100,12 +78,16 @@ def init_pinecone():
             )
             print(f"Created new index: {index_name}")
             
+            # Wait for index to be ready
             print("Waiting for index to be ready...")
             while not pc.describe_index(index_name).status['ready']:
                 time.sleep(1)
             print("Index is ready!")
+        else:
+            print(f"Using existing index: {index_name}")
+        
+        index = pc.Index(index_name)
     
-    index = pc.Index(index_name)
     return pc, index
 
 # Text extraction functions
@@ -144,30 +126,9 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
     return chunks
 
 # AI functions
-def get_embedding(text: str) -> List[float]:
-    """Simple embedding using basic text features - much lighter than sentence-transformers"""
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    import numpy as np
-    
-    # Create a simple TF-IDF based embedding
-    # This is much lighter but still functional for basic RAG
-    vectorizer = TfidfVectorizer(max_features=384, stop_words='english')
-    
-    # Fit on the text and transform
-    try:
-        tfidf_matrix = vectorizer.fit_transform([text])
-        embedding = tfidf_matrix.toarray()[0].tolist()
-        
-        # Pad or truncate to exactly 384 dimensions
-        if len(embedding) < 384:
-            embedding.extend([0.0] * (384 - len(embedding)))
-        else:
-            embedding = embedding[:384]
-            
-        return embedding
-    except:
-        # Fallback: return zero vector
-        return [0.0] * 384
+def get_embedding(text: str, embedding_model) -> List[float]:
+    embedding = embedding_model.encode(text)
+    return embedding.tolist()
 
 def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
     prompt = f"""
@@ -189,68 +150,14 @@ Answer:
         return f"Error generating response: {str(e)}"
 
 # Pinecone operations
-def upsert_chunks(chunks: List[str], index):
-    vectors = []
-    for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk)
-        vectors.append({
-            "id": f"chunk-{i}",
-            "values": embedding,
-            "metadata": {"text": chunk}
-        })
-    
-    batch_size = 100
-    for i in range(0, len(vectors), batch_size):
-        batch = vectors[i:i + batch_size]
-        index.upsert(vectors=batch)
-    
-    print(f"Upserted {len(chunks)} chunks to Pinecone.")
-
-def query_chunks(query: str, index, top_k: int = 5) -> List[str]:
-    query_embedding = get_embedding(query)
+def query_chunks(query: str, index, embedding_model, top_k: int = 5) -> List[str]:
+    query_embedding = get_embedding(query, embedding_model)
     query_response = index.query(
         vector=query_embedding,
         top_k=top_k,
         include_metadata=True
     )
     return [match.metadata.get("text", "") for match in query_response.matches]
-
-# Initialize document processing
-def initialize_policy_document(index):
-    policy_file = "policy.pdf"
-    
-    if not os.path.exists(policy_file):
-        print(f"Warning: Policy file {policy_file} not found. Skipping document initialization.")
-        return False
-    
-    print(f"Loading policy document: {policy_file}")
-    
-    full_text = extract_text(policy_file)
-    print(f"Extracted {len(full_text)} characters from policy document")
-    
-    chunks = chunk_text(full_text)
-    print(f"Created {len(chunks)} chunks")
-    
-    try:
-        stats = index.describe_index_stats()
-        if stats.total_vector_count > 0:
-            print("Clearing existing vectors from index...")
-            index.delete(delete_all=True)
-            print("Cleared existing vectors from index")
-    except Exception as e:
-        print(f"Could not check/clear index stats: {e}")
-    
-    upsert_chunks(chunks, index)
-    print("Policy document successfully indexed")
-    return True
-
-# Global variables for models
-gemini_model = None
-pc = None
-index = None
-
-# FastAPI setup
-app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
 
 security = HTTPBearer()
 
@@ -276,44 +183,19 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    global gemini_model, pc, index
-    
-    print("Initializing services...")
-    
-    # Check required environment variables
-    required_vars = ["GEMINI_API_KEY", "PINECONE_API_KEY", "API_BEARER_TOKEN"]
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
-        raise Exception(f"Missing required environment variables: {missing_vars}")
-    
-    # Initialize AI models
-    gemini_model = initialize_services()
-    print("AI models initialized")
-    
-    # Initialize Pinecone
-    pc, index = init_pinecone()
-    print("Pinecone initialized")
-    
-    # Initialize policy document
-    doc_loaded = initialize_policy_document(index)
-    if doc_loaded:
-        print("Startup complete - Policy document loaded and indexed")
-    else:
-        print("Startup complete - No policy document found, API ready for manual document upload")
-
 # API endpoints
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
-    global gemini_model, index
+    
+    # Initialize services on each request (serverless pattern)
+    gemini_model, embedding_model = initialize_services()
+    pc, index = init_pinecone()
     
     answers = []
     
     for question in req.questions:
         try:
-            relevant_clauses = query_chunks(question, index)
+            relevant_clauses = query_chunks(question, index, embedding_model)
             
             if not relevant_clauses:
                 answers.append("No relevant information found in the policy document for this question.")
@@ -333,6 +215,24 @@ async def health_check():
 
 @app.get("/info")
 async def get_info():
+    try:
+        pc, index = init_pinecone()
+        stats = index.describe_index_stats()
+        return {
+            "status": "ready",
+            "total_vectors": stats.total_vector_count,
+            "index_fullness": stats.index_fullness,
+            "embedding_model": "all-MiniLM-L6-v2",
+            "llm_model": "gemini-pro"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# Vercel serverless handler
+handler = Mangum(app) Policy RAG API with Gemini is running"}
+
+@app.get("/info")
+async def get_info():
     global index
     try:
         stats = index.describe_index_stats()
@@ -340,13 +240,21 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "TF-IDF (lightweight)",
+            "embedding_model": "all-MiniLM-L6-v2",
             "llm_model": "gemini-pro"
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# For Railway deployment
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# For Vercel deployment
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Vercel serverless handler
+def handler(request):
+    return app(request)
