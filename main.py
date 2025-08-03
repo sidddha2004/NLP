@@ -23,7 +23,7 @@ import PyPDF2
 import docx
 
 # AI and vector database
-from pinecone import Pinecone, ServerlessSpec
+import pinecone
 import openai
 
 # Global variables for models
@@ -125,41 +125,49 @@ async def initialize_pinecone():
     
     try:
         api_key = os.getenv("PINECONE_API_KEY")
+        environment = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")  # Add environment support
+        
         if not api_key:
             raise ValueError("PINECONE_API_KEY environment variable not set")
         
-        pc = Pinecone(api_key=api_key)
+        # Initialize Pinecone (v2.x API)
+        pinecone.init(api_key=api_key, environment=environment)
+        
         index_name = "policy-docs-gemini-hash"
         
         # Check existing indexes
-        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        existing_indexes = pinecone.list_indexes()
+        logger.info(f"📋 Found existing indexes: {existing_indexes}")
         
         if index_name not in existing_indexes:
             logger.info(f"Creating index: {index_name}")
-            pc.create_index(
+            pinecone.create_index(
                 name=index_name,
                 dimension=512,
-                metric="cosine",
-                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                metric="cosine"
             )
             
-            # Wait for index to be ready (with timeout)
-            max_wait = 30  # Reduced wait time
+            # Wait for index to be ready
+            max_wait = 30
             waited = 0
             while waited < max_wait:
                 try:
-                    if pc.describe_index(index_name).status['ready']:
+                    if pinecone.describe_index(index_name).status['ready']:
                         break
                 except:
                     pass
                 time.sleep(2)
                 waited += 2
+                if waited % 10 == 0:
+                    logger.info(f"Still waiting for index... ({waited}/{max_wait}s)")
             
             if waited >= max_wait:
                 logger.warning("Index creation timeout - will retry later")
         
-        index = pc.Index(index_name)
+        index = pinecone.Index(index_name)
+        pc = pinecone  # Keep reference for compatibility
         initialization_status["pinecone"] = True
+        logger.info("✓ Pinecone initialized successfully")
         
     except Exception as e:
         logger.error(f"Failed to initialize Pinecone: {e}")
@@ -437,7 +445,8 @@ async def health_check():
             "port": os.environ.get("PORT", "8000"),
             "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
             "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
-            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
+            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN")),
+            "pinecone_env": os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
         }
     }
 
@@ -514,6 +523,7 @@ if __name__ == "__main__":
     logger.info(f"🔑 Environment check:")
     logger.info(f"  - OPENAI_API_KEY: {'✓' if os.getenv('OPENAI_API_KEY') else '✗'}")
     logger.info(f"  - PINECONE_API_KEY: {'✓' if os.getenv('PINECONE_API_KEY') else '✗'}")
+    logger.info(f"  - PINECONE_ENVIRONMENT: {os.getenv('PINECONE_ENVIRONMENT', 'us-east-1')}")
     logger.info(f"  - API_BEARER_TOKEN: {'✓' if os.getenv('API_BEARER_TOKEN') else '✗'}")
     logger.info(f"  - policy.pdf: {'✓' if os.path.exists('policy.pdf') else '✗'}")
     
