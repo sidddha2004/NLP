@@ -1,6 +1,5 @@
 # Optimized requirements.txt for Railway deployment
-# Removed heavy ML dependencies to keep image size under 6.8GB
-
+# Removed OpenAI dependency, added sentence-transformers for free embeddings
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 PyPDF2==3.0.1
@@ -9,8 +8,8 @@ google-generativeai==0.3.2
 pinecone==3.0.0
 pydantic==2.5.0
 python-multipart==0.0.6
-openai==1.6.1
-
+sentence-transformers==2.2.2
+torch==2.1.1
 # Keep these lightweight packages
 setuptools
 wheel
