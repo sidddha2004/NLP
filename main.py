@@ -1,4 +1,4 @@
-# main.py - Optimized Railway deployment version
+# main.py - Vercel deployment version (No OpenAI required)
 
 import os
 from typing import List
@@ -18,8 +18,8 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 
-# Use OpenAI embeddings instead of sentence-transformers to reduce image size
-import openai
+# Use sentence-transformers instead of OpenAI for embeddings (free alternative)
+from sentence_transformers import SentenceTransformer
 
 # FastAPI setup
 app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
@@ -34,217 +34,12 @@ app.add_middleware(
 
 # Global variables for models
 gemini_model = None
-openai_client = None
+embedding_model = None
 pc = None
 index = None
 
 # Initialize AI models and services
 def initialize_services():
-    global gemini_model, openai_client
+    global gemini_model, embedding_model
     
     if gemini_model is None:
-        # Configure Gemini
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        gemini_model = genai.GenerativeModel('gemini-pro')
-    
-    if openai_client is None:
-        # Initialize OpenAI client for embeddings
-        openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
-    return gemini_model, openai_client
-
-# Initialize Pinecone
-def init_pinecone():
-    global pc, index
-    
-    if pc is None:
-        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    
-    if index is None:
-        index_name = "policy-docs-gemini-v2"
-        
-        # Check if index exists
-        existing_indexes = [idx.name for idx in pc.list_indexes()]
-        
-        if index_name not in existing_indexes:
-            print(f"Creating new index: {index_name}")
-            pc.create_index(
-                name=index_name,
-                dimension=1536,  # OpenAI text-embedding-3-small dimension
-                metric="cosine",
-                spec=ServerlessSpec(
-                    cloud="aws",
-                    region="us-east-1"
-                )
-            )
-            print(f"Created new index: {index_name}")
-            
-            # Wait for index to be ready
-            print("Waiting for index to be ready...")
-            while not pc.describe_index(index_name).status['ready']:
-                time.sleep(1)
-            print("Index is ready!")
-        else:
-            print(f"Using existing index: {index_name}")
-        
-        index = pc.Index(index_name)
-    
-    return pc, index
-
-# Text extraction functions
-def extract_text_from_pdf(pdf_path: str) -> str:
-    with open(pdf_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-def extract_text_from_docx(docx_path: str) -> str:
-    doc = docx.Document(docx_path)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-def extract_text(file_path: str) -> str:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        return extract_text_from_pdf(file_path)
-    elif ext == ".docx":
-        return extract_text_from_docx(file_path)
-    else:
-        raise ValueError(f"Unsupported document format: {ext}")
-
-# Text chunking
-def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
-    chunks = []
-    start = 0
-    length = len(text)
-    while start < length:
-        end = min(start + chunk_size, length)
-        chunks.append(text[start:end])
-        start = end - overlap if end - overlap > start else end
-    return chunks
-
-# AI functions using OpenAI embeddings
-def get_embedding(text: str, openai_client) -> List[float]:
-    try:
-        response = openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text,
-            encoding_format="float"
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"Error getting embedding: {e}")
-        return None
-
-def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
-    prompt = f"""
-You are an expert assistant who answers insurance policy questions precisely and cites the clauses.
-
-Question: {question}
-
-Use ONLY the following clauses and explicitly mention or quote them in your answer:
-
-{chr(10).join([f"- {clause}" for clause in context_clauses])}
-
-Answer:
-"""
-    
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
-
-# Pinecone operations
-def query_chunks(query: str, index, openai_client, top_k: int = 5) -> List[str]:
-    query_embedding = get_embedding(query, openai_client)
-    if query_embedding is None:
-        return []
-    
-    query_response = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
-    return [match.metadata.get("text", "") for match in query_response.matches]
-
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    expected_token = os.getenv("API_BEARER_TOKEN")
-    if not expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="API_BEARER_TOKEN not configured"
-        )
-    if token != expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Invalid or missing authorization token"
-        )
-    return True
-
-# Request/Response models
-class QueryRequest(BaseModel):
-    questions: List[str]
-
-class QueryResponse(BaseModel):
-    answers: List[str]
-
-# Initialize services once at startup for Railway
-gemini_model, openai_client = initialize_services()
-pc, index = init_pinecone()
-
-# API endpoints
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
-    
-    # Use pre-initialized services (Railway pattern)
-    global gemini_model, openai_client, pc, index
-    
-    answers = []
-    
-    for question in req.questions:
-        try:
-            relevant_clauses = query_chunks(question, index, openai_client)
-            
-            if not relevant_clauses:
-                answers.append("No relevant information found in the policy document for this question.")
-                continue
-            
-            answer = query_gemini(question, relevant_clauses, gemini_model)
-            answers.append(answer)
-            
-        except Exception as e:
-            answers.append(f"Error processing question: {str(e)}")
-    
-    return QueryResponse(answers=answers)
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "message": "Insurance Policy RAG API with Gemini is running"}
-
-@app.get("/info")
-async def get_info():
-    global index
-    try:
-        stats = index.describe_index_stats()
-        return {
-            "status": "ready",
-            "total_vectors": stats.total_vector_count,
-            "index_fullness": stats.index_fullness,
-            "embedding_model": "text-embedding-3-small",
-            "llm_model": "gemini-pro"
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# For Railway deployment - run with uvicorn
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
