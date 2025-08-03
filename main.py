@@ -1,4 +1,4 @@
-# main.py - Vercel deployment version
+# main.py - Railway deployment version
 
 import os
 from typing import List
@@ -9,7 +9,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from mangum import Mangum
+# Removed mangum import as it's not needed for Railway
 
 # Document processing
 import PyPDF2
@@ -183,13 +183,16 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
+# Initialize services once at startup for Railway
+gemini_model, embedding_model = initialize_services()
+pc, index = init_pinecone()
+
 # API endpoints
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
-    # Initialize services on each request (serverless pattern)
-    gemini_model, embedding_model = initialize_services()
-    pc, index = init_pinecone()
+    # Use pre-initialized services (Railway pattern)
+    global gemini_model, embedding_model, pc, index
     
     answers = []
     
@@ -215,24 +218,6 @@ async def health_check():
 
 @app.get("/info")
 async def get_info():
-    try:
-        pc, index = init_pinecone()
-        stats = index.describe_index_stats()
-        return {
-            "status": "ready",
-            "total_vectors": stats.total_vector_count,
-            "index_fullness": stats.index_fullness,
-            "embedding_model": "all-MiniLM-L6-v2",
-            "llm_model": "gemini-pro"
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# Vercel serverless handler
-handler = Mangum(app) Policy RAG API with Gemini is running"}
-
-@app.get("/info")
-async def get_info():
     global index
     try:
         stats = index.describe_index_stats()
@@ -246,15 +231,8 @@ async def get_info():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# For Vercel deployment
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Vercel serverless handler
-def handler(request):
-    return app(request)
+# For Railway deployment - run with uvicorn
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
