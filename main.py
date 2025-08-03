@@ -25,10 +25,34 @@ def initialize_services():
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     gemini_model = genai.GenerativeModel('gemini-pro')
     
-    # Initialize embedding model
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    # Use lighter embedding approach
+    return gemini_model
+
+# AI functions - Updated for lighter embeddings
+def get_embedding(text: str) -> List[float]:
+    """Simple embedding using basic text features - much lighter than sentence-transformers"""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import numpy as np
     
-    return gemini_model, embedding_model
+    # Create a simple TF-IDF based embedding
+    # This is much lighter but still functional for basic RAG
+    vectorizer = TfidfVectorizer(max_features=384, stop_words='english')
+    
+    # Fit on the text and transform
+    try:
+        tfidf_matrix = vectorizer.fit_transform([text])
+        embedding = tfidf_matrix.toarray()[0].tolist()
+        
+        # Pad or truncate to exactly 384 dimensions
+        if len(embedding) < 384:
+            embedding.extend([0.0] * (384 - len(embedding)))
+        else:
+            embedding = embedding[:384]
+            
+        return embedding
+    except:
+        # Fallback: return zero vector
+        return [0.0] * 384
 
 # Initialize Pinecone
 def init_pinecone():
@@ -120,9 +144,30 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
     return chunks
 
 # AI functions
-def get_embedding(text: str, embedding_model) -> List[float]:
-    embedding = embedding_model.encode(text)
-    return embedding.tolist()
+def get_embedding(text: str) -> List[float]:
+    """Simple embedding using basic text features - much lighter than sentence-transformers"""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import numpy as np
+    
+    # Create a simple TF-IDF based embedding
+    # This is much lighter but still functional for basic RAG
+    vectorizer = TfidfVectorizer(max_features=384, stop_words='english')
+    
+    # Fit on the text and transform
+    try:
+        tfidf_matrix = vectorizer.fit_transform([text])
+        embedding = tfidf_matrix.toarray()[0].tolist()
+        
+        # Pad or truncate to exactly 384 dimensions
+        if len(embedding) < 384:
+            embedding.extend([0.0] * (384 - len(embedding)))
+        else:
+            embedding = embedding[:384]
+            
+        return embedding
+    except:
+        # Fallback: return zero vector
+        return [0.0] * 384
 
 def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
     prompt = f"""
@@ -144,10 +189,10 @@ Answer:
         return f"Error generating response: {str(e)}"
 
 # Pinecone operations
-def upsert_chunks(chunks: List[str], index, embedding_model):
+def upsert_chunks(chunks: List[str], index):
     vectors = []
     for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk, embedding_model)
+        embedding = get_embedding(chunk)
         vectors.append({
             "id": f"chunk-{i}",
             "values": embedding,
@@ -161,8 +206,8 @@ def upsert_chunks(chunks: List[str], index, embedding_model):
     
     print(f"Upserted {len(chunks)} chunks to Pinecone.")
 
-def query_chunks(query: str, index, embedding_model, top_k: int = 5) -> List[str]:
-    query_embedding = get_embedding(query, embedding_model)
+def query_chunks(query: str, index, top_k: int = 5) -> List[str]:
+    query_embedding = get_embedding(query)
     query_response = index.query(
         vector=query_embedding,
         top_k=top_k,
@@ -171,7 +216,7 @@ def query_chunks(query: str, index, embedding_model, top_k: int = 5) -> List[str
     return [match.metadata.get("text", "") for match in query_response.matches]
 
 # Initialize document processing
-def initialize_policy_document(index, embedding_model):
+def initialize_policy_document(index):
     policy_file = "policy.pdf"
     
     if not os.path.exists(policy_file):
@@ -195,13 +240,12 @@ def initialize_policy_document(index, embedding_model):
     except Exception as e:
         print(f"Could not check/clear index stats: {e}")
     
-    upsert_chunks(chunks, index, embedding_model)
+    upsert_chunks(chunks, index)
     print("Policy document successfully indexed")
     return True
 
 # Global variables for models
 gemini_model = None
-embedding_model = None
 pc = None
 index = None
 
@@ -235,7 +279,7 @@ class QueryResponse(BaseModel):
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    global gemini_model, embedding_model, pc, index
+    global gemini_model, pc, index
     
     print("Initializing services...")
     
@@ -246,7 +290,7 @@ async def startup_event():
         raise Exception(f"Missing required environment variables: {missing_vars}")
     
     # Initialize AI models
-    gemini_model, embedding_model = initialize_services()
+    gemini_model = initialize_services()
     print("AI models initialized")
     
     # Initialize Pinecone
@@ -254,7 +298,7 @@ async def startup_event():
     print("Pinecone initialized")
     
     # Initialize policy document
-    doc_loaded = initialize_policy_document(index, embedding_model)
+    doc_loaded = initialize_policy_document(index)
     if doc_loaded:
         print("Startup complete - Policy document loaded and indexed")
     else:
@@ -263,13 +307,13 @@ async def startup_event():
 # API endpoints
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
-    global gemini_model, embedding_model, index
+    global gemini_model, index
     
     answers = []
     
     for question in req.questions:
         try:
-            relevant_clauses = query_chunks(question, index, embedding_model)
+            relevant_clauses = query_chunks(question, index)
             
             if not relevant_clauses:
                 answers.append("No relevant information found in the policy document for this question.")
@@ -296,7 +340,7 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "all-MiniLM-L6-v2",
+            "embedding_model": "TF-IDF (lightweight)",
             "llm_model": "gemini-pro"
         }
     except Exception as e:
