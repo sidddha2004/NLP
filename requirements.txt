@@ -1,28 +1,19 @@
-# Core FastAPI stack
+# Core FastAPI (pinned minimal versions)
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
+uvicorn==0.24.0
 pydantic==2.5.0
 
-# Security for Bearer token
+# Security
 python-jose[cryptography]==3.3.0
 
-# Document processing (essential)
+# Document processing (minimal)
 PyPDF2==3.0.1
-python-docx==1.1.0
-pdfplumber==0.10.3
 
 # Vector database
 pinecone-client==2.2.4
 
-# AI - Google Gemini
+# AI
 google-generativeai==0.3.2
 
-# Proper embeddings (compact model)
+# Lightweight but high-quality embeddings
 sentence-transformers==2.2.2
-
-# HTTP requests
-httpx==0.25.2
-
-# Environment management
-python-decouple==3.8
-
