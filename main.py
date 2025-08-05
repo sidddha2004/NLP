@@ -1,4 +1,4 @@
-# main.py - Fixed Railway deployment for Insurance Policy RAG API
+# main.py - Fixed Railway deployment for Insurance Policy RAG API with Together AI
 
 import os
 from typing import List
@@ -23,10 +23,10 @@ import docx
 
 # AI and vector database
 from pinecone import Pinecone, ServerlessSpec
-import google.generativeai as genai
+import together
 
 # FastAPI setup
-app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
+app = FastAPI(title="Insurance Policy RAG API with Together AI", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,11 +37,11 @@ app.add_middleware(
 )
 
 # Global variables for models
-gemini_model = None
+together_client = None
 pc = None
 index = None
 initialization_status = {
-    "gemini": False,
+    "together": False,
     "pinecone": False,
     "document": False,
     "error": None
@@ -49,23 +49,23 @@ initialization_status = {
 
 # Initialize AI models and services
 def initialize_services():
-    global gemini_model, initialization_status
+    global together_client, initialization_status
     
     try:
-        if gemini_model is None:
-            api_key = os.getenv("GEMINI_API_KEY")
+        if together_client is None:
+            api_key = os.getenv("TOGETHER_API_KEY")
             if not api_key:
-                raise ValueError("GEMINI_API_KEY environment variable not set")
+                raise ValueError("TOGETHER_API_KEY environment variable not set")
             
-            # Configure Gemini
-            genai.configure(api_key=api_key)
-            gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("Gemini model initialized successfully")
-            initialization_status["gemini"] = True
+            # Configure Together AI
+            together.api_key = api_key
+            together_client = together
+            logger.info("Together AI client initialized successfully")
+            initialization_status["together"] = True
         
-        return gemini_model
+        return together_client
     except Exception as e:
-        logger.error(f"Failed to initialize Gemini: {e}")
+        logger.error(f"Failed to initialize Together AI: {e}")
         initialization_status["error"] = str(e)
         raise e
 
@@ -84,7 +84,7 @@ def init_pinecone():
             logger.info("✓ Pinecone client initialized")
         
         if index is None:
-            index_name = "policy-docs-gemini-hash"
+            index_name = "policy-docs-together-hash"
             
             # Check if index exists
             try:
@@ -251,21 +251,28 @@ def get_simple_embedding(text: str) -> List[float]:
         # Return zero vector if error
         return [0.0] * 512
 
-# Alternative: Use Gemini for embeddings (API-based, no local ML dependencies)
-def get_gemini_embedding(text: str, gemini_model) -> List[float]:
-    """Use Gemini to create embeddings via API - EXACTLY 512 dimensions"""
+# Alternative: Use Together AI for embeddings (API-based, no local ML dependencies)
+def get_together_embedding(text: str, together_client) -> List[float]:
+    """Use Together AI to create embeddings via API - EXACTLY 512 dimensions"""
     try:
-        # Use Gemini to generate a semantic representation
+        # Use Together AI to generate a semantic representation
         prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
-        response = gemini_model.generate_content(prompt)
-        keywords = response.text.strip()
+        
+        response = together_client.Complete.create(
+            prompt=prompt,
+            model="mistralai/Mistral-7B-Instruct-v0.2",
+            max_tokens=200,
+            temperature=0.1
+        )
+        
+        keywords = response['output']['choices'][0]['text'].strip()
         
         # Convert keywords to embedding using simple hashing
         embedding = get_simple_embedding(keywords)
         
         # Double check dimensions
         if len(embedding) != 512:
-            logger.warning(f"Gemini embedding has {len(embedding)} dimensions, expected 512")
+            logger.warning(f"Together AI embedding has {len(embedding)} dimensions, expected 512")
             # Pad or truncate to exactly 512
             if len(embedding) < 512:
                 embedding.extend([0.0] * (512 - len(embedding)))
@@ -275,13 +282,12 @@ def get_gemini_embedding(text: str, gemini_model) -> List[float]:
         return embedding
         
     except Exception as e:
-        logger.error(f"Error getting Gemini embedding: {e}")
+        logger.error(f"Error getting Together AI embedding: {e}")
         # Fallback to simple embedding
         return get_simple_embedding(text)
 
-def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
-    prompt = f"""
-You are an expert assistant who answers insurance policy questions precisely and cites the clauses.
+def query_together(question: str, context_clauses: List[str], together_client) -> str:
+    prompt = f"""You are an expert assistant who answers insurance policy questions precisely and cites the clauses.
 
 Question: {question}
 
@@ -289,22 +295,26 @@ Use ONLY the following clauses and explicitly mention or quote them in your answ
 
 {chr(10).join([f"- {clause}" for clause in context_clauses])}
 
-Answer:
-"""
+Answer:"""
     
     try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
+        response = together_client.Complete.create(
+            prompt=prompt,
+            model="mistralai/Mistral-7B-Instruct-v0.2",
+            max_tokens=500,
+            temperature=0.3
+        )
+        return response['output']['choices'][0]['text'].strip()
     except Exception as e:
-        logger.error(f"Error generating Gemini response: {e}")
+        logger.error(f"Error generating Together AI response: {e}")
         return f"Error generating response: {str(e)}"
 
 # Pinecone operations
-def query_chunks(query: str, index, gemini_model, top_k: int = 5) -> List[str]:
+def query_chunks(query: str, index, together_client, top_k: int = 5) -> List[str]:
     try:
-        # Try Gemini-based embedding first, fallback to simple embedding
+        # Try Together AI-based embedding first, fallback to simple embedding
         try:
-            query_embedding = get_gemini_embedding(query, gemini_model)
+            query_embedding = get_together_embedding(query, together_client)
         except:
             query_embedding = get_simple_embedding(query)
         
@@ -322,13 +332,13 @@ def query_chunks(query: str, index, gemini_model, top_k: int = 5) -> List[str]:
         return []
 
 # Pinecone upsert functions
-def upsert_chunks(chunks: List[str], index, gemini_model):
+def upsert_chunks(chunks: List[str], index, together_client):
     try:
         vectors = []
         for i, chunk in enumerate(chunks):
-            # Try Gemini-based embedding first, fallback to simple embedding
+            # Try Together AI-based embedding first, fallback to simple embedding
             try:
-                embedding = get_gemini_embedding(chunk, gemini_model)
+                embedding = get_together_embedding(chunk, together_client)
             except:
                 embedding = get_simple_embedding(chunk)
                 
@@ -353,7 +363,7 @@ def upsert_chunks(chunks: List[str], index, gemini_model):
 # Initialize policy document function
 def initialize_policy_document():
     """Extract and upsert the policy.pdf document once at startup"""
-    global index, gemini_model, initialization_status
+    global index, together_client, initialization_status
     
     try:
         policy_file = "policy.pdf"
@@ -396,7 +406,7 @@ def initialize_policy_document():
             logger.info("Proceeding with upsert...")
         
         # Upsert chunks to Pinecone
-        upsert_chunks(chunks, index, gemini_model)
+        upsert_chunks(chunks, index, together_client)
         logger.info("Policy document successfully indexed")
         initialization_status["document"] = True
         
@@ -435,14 +445,14 @@ class QueryResponse(BaseModel):
 # Initialize services once at startup for Railway
 @app.on_event("startup")
 async def startup_event():
-    global gemini_model, pc, index, initialization_status
+    global together_client, pc, index, initialization_status
     
     logger.info("=== STARTUP: Initializing services ===")
     
     try:
-        # Initialize Gemini
-        gemini_model = initialize_services()
-        logger.info("✓ Gemini initialized successfully")
+        # Initialize Together AI
+        together_client = initialize_services()
+        logger.info("✓ Together AI initialized successfully")
         
         # Initialize Pinecone
         pc, index = init_pinecone()
@@ -469,9 +479,9 @@ async def startup_event():
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
     # Check if services are initialized
-    global gemini_model, pc, index
+    global together_client, pc, index
     
-    if not gemini_model or not index:
+    if not together_client or not index:
         logger.error("Services not properly initialized")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -483,13 +493,13 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
     for question in req.questions:
         try:
             logger.info(f"Processing question: {question[:100]}...")
-            relevant_clauses = query_chunks(question, index, gemini_model)
+            relevant_clauses = query_chunks(question, index, together_client)
             
             if not relevant_clauses:
                 answers.append("No relevant information found in the policy document for this question.")
                 continue
             
-            answer = query_gemini(question, relevant_clauses, gemini_model)
+            answer = query_together(question, relevant_clauses, together_client)
             answers.append(answer)
             
         except Exception as e:
@@ -502,11 +512,11 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
 async def health_check():
     return {
         "status": "healthy", 
-        "message": "Insurance Policy RAG API with Gemini is running",
+        "message": "Insurance Policy RAG API with Together AI is running",
         "initialization_status": initialization_status,
         "environment": {
             "port": os.environ.get("PORT", "8000"),
-            "has_gemini_key": bool(os.getenv("GEMINI_API_KEY")),
+            "has_together_key": bool(os.getenv("TOGETHER_API_KEY")),
             "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
             "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
         }
@@ -524,8 +534,8 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "gemini-enhanced-hash-embeddings",
-            "llm_model": "gemini-pro",
+            "embedding_model": "together-enhanced-hash-embeddings",
+            "llm_model": "mistralai/Mistral-7B-Instruct-v0.2",
             "initialization_status": initialization_status
         }
     except Exception as e:
@@ -535,7 +545,7 @@ async def get_info():
 @app.get("/")
 async def root():
     return {
-        "message": "Insurance Policy RAG API with Gemini",
+        "message": "Insurance Policy RAG API with Together AI",
         "version": "1.0.0",
         "endpoints": {
             "health": "/health",
