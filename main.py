@@ -19,10 +19,10 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 
 # --- API KEYS: Set them here directly ---
-OPENROUTER_API_KEY = "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".strip()
+OPENROUTER_API_KEY = "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".strip()
 PINECONE_API_KEY = "pcsk_2HMPt3_6R2wiF8G1zmHjMaAQmJh69wEFDD16YtJkk3YrTC9wvTD5EiaLVZpLve4Up8nFbt".strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.0-flash"
+OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
