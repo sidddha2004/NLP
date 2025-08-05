@@ -5,7 +5,7 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 import os
 import uuid
-import requests
+import google.generativeai as genai
 import nltk
 
 # Ensure NLTK sentence tokenizer is available
@@ -16,12 +16,16 @@ from nltk.tokenize import sent_tokenize
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV", "gcp-starter")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "insurance-rag")
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 app = FastAPI()
 
 # Load embedding model
 model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Initialize Gemini API
+genai.configure(api_key=GOOGLE_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -61,29 +65,18 @@ def chunk_sentences(text: str, max_tokens=150, overlap=1):
 def get_embedding(text):
     return model.encode(text).tolist()
 
-# Answer generation using Together Gemini
+# Answer generation using Gemini
 
 def generate_answer_from_gemini(context: str, query: str):
     prompt = f"""You are an insurance assistant. Based on the policy below, answer the question.
 
 Policy:
-"""
 {context}
-"""
 
 Question: {query}
 Answer:"""
-    response = requests.post(
-        "https://api.together.xyz/inference",
-        headers={"Authorization": f"Bearer {TOGETHER_API_KEY}"},
-        json={
-            "model": "gemini-1.5-flash",
-            "prompt": prompt,
-            "max_tokens": 300,
-            "temperature": 0.2
-        }
-    )
-    return response.json().get("output", "").strip()
+    response = gemini_model.generate_content(prompt)
+    return response.text.strip()
 
 # Upload endpoint
 @app.post("/upload/")
