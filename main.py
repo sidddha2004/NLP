@@ -1,4 +1,4 @@
-# main.py - Fixed Railway deployment for Insurance Policy RAG API
+# main.py - Railway optimized with lazy loading
 
 import os
 from typing import List
@@ -7,9 +7,6 @@ import hashlib
 import traceback
 import logging
 import asyncio
-
-# Add the import for Sentence Transformers
-from sentence_transformers import SentenceTransformer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for models
+# Global variables for models - using lazy loading
 gemini_model = None
 sentence_transformer_model = None
 pc = None
@@ -76,12 +73,17 @@ def initialize_gemini():
         initialization_status["error"] = str(e)
         raise e
 
-# New function to initialize Sentence Transformer
+# LAZY LOADING: Only import and initialize when needed
 def initialize_sentence_transformer():
     global sentence_transformer_model, initialization_status
     try:
         if sentence_transformer_model is None:
+            # Import only when needed to reduce startup time
+            from sentence_transformers import SentenceTransformer
+            
+            # Use smaller, faster model
             model_name = "all-MiniLM-L6-v2"
+            logger.info(f"Loading Sentence Transformer model: {model_name}")
             sentence_transformer_model = SentenceTransformer(model_name)
             logger.info(f"Sentence Transformer model '{model_name}' initialized successfully")
             initialization_status["sentence_transformer"] = True
@@ -117,7 +119,7 @@ def init_pinecone():
                     logger.info(f"🏗 Creating new index: {index_name}")
                     pc.create_index(
                         name=index_name,
-                        dimension=384,  # Change dimension to 384 for all-MiniLM-L6-v2
+                        dimension=384,  # Dimension for all-MiniLM-L6-v2
                         metric="cosine",
                         spec=ServerlessSpec(
                             cloud="aws",
@@ -208,8 +210,13 @@ def get_sentence_transformer_embedding(text: str) -> List[float]:
     """Create a semantic embedding using a Sentence Transformer model"""
     global sentence_transformer_model
     try:
+        # Lazy initialization - only load when first needed
         if sentence_transformer_model is None:
-            raise RuntimeError("Sentence Transformer model is not initialized")
+            initialize_sentence_transformer()
+        
+        if sentence_transformer_model is None:
+            raise RuntimeError("Sentence Transformer model failed to initialize")
+        
         embedding = sentence_transformer_model.encode(text).tolist()
         return embedding
     except Exception as e:
@@ -311,19 +318,10 @@ async def process_documents_background():
         
         policy_file = "policy.pdf"
         
-        # Debug: List all files in current directory
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"Files in current directory: {os.listdir('.')}")
-        
         if not os.path.exists(policy_file):
-            logger.error(f"Policy file {policy_file} not found in {os.getcwd()}")
-            logger.error(f"Available files: {os.listdir('.')}")
+            logger.error(f"Policy file {policy_file} not found")
             initialization_status["document_processing"] = False
             return
-        
-        # Check file permissions and size
-        file_stat = os.stat(policy_file)
-        logger.info(f"Policy file found - Size: {file_stat.st_size} bytes, Permissions: {oct(file_stat.st_mode)}")
         
         logger.info(f"Loading policy document: {policy_file}")
         
@@ -342,12 +340,11 @@ async def process_documents_background():
                 logger.info("Clearing existing vectors from index...")
                 index.delete(delete_all=True)
                 logger.info("Cleared existing vectors from index")
-                await asyncio.sleep(5)  # Wait a bit after clearing
+                await asyncio.sleep(5)
             else:
                 logger.info("Index is empty, no need to clear")
         except Exception as e:
             logger.warning(f"Could not check/clear index stats: {e}")
-            logger.info("Proceeding with upsert...")
         
         # Upsert chunks to Pinecone (async with rate limiting)
         await upsert_chunks_async(chunks, index)
@@ -388,10 +385,10 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# FIXED: Non-blocking startup event
+# OPTIMIZED: Minimal startup - only initialize fast services
 @app.on_event("startup")
 async def startup_event():
-    global gemini_model, pc, index, sentence_transformer_model, initialization_status
+    global gemini_model, pc, index, initialization_status
     
     logger.info("=== STARTUP: Initializing core services ===")
     
@@ -399,10 +396,6 @@ async def startup_event():
         # Initialize Gemini (fast)
         gemini_model = initialize_gemini()
         logger.info("✓ Gemini initialized successfully")
-        
-        # Initialize Sentence Transformer (download model)
-        sentence_transformer_model = initialize_sentence_transformer()
-        logger.info("✓ Sentence Transformer initialized successfully")
         
         # Initialize Pinecone (fast)
         pc, index = init_pinecone()
@@ -486,7 +479,8 @@ async def get_detailed_status():
     try:
         status_info = {
             "services": initialization_status,
-            "server_ready": bool(gemini_model and index and sentence_transformer_model),
+            "server_ready": bool(gemini_model and index),
+            "sentence_transformer_ready": bool(sentence_transformer_model),
             "document_ready": initialization_status["document"],
             "document_processing": initialization_status["document_processing"]
         }
@@ -519,7 +513,7 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "all-MiniLM-L6-v2",
+            "embedding_model": "all-MiniLM-L6-v2 (lazy loaded)",
             "llm_model": "gemini-1.5-flash",
             "initialization_status": initialization_status
         }
