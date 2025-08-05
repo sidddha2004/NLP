@@ -19,8 +19,8 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 
 # --- API KEYS: Set them here directly ---
-OPENROUTER_API_KEY = "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"
-PINECONE_API_KEY = "pcsk_2HMPt3_6R2wiF8G1zmHjMaAQmJh69wEFDD16YtJkk3YrTC9wvTD5EiaLVZpLve4Up8nFbt"
+OPENROUTER_API_KEY = "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".strip()
+PINECONE_API_KEY = "pcsk_2HMPt3_6R2wiF8G1zmHjMaAQmJh69wEFDD16YtJkk3YrTC9wvTD5EiaLVZpLve4Up8nFbt".strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "google/gemini-2.0-flash"
 
@@ -48,6 +48,12 @@ initialization_status = {
 
 # --- LLM via OpenRouter Gemini 2.0 Flash ---
 def query_openrouter(prompt: str, model=OPENROUTER_MODEL, max_tokens=1024, temperature=0.0) -> str:
+    # Debug print to verify API key presence
+    logger.debug(f"Using OpenRouter API Key: '{OPENROUTER_API_KEY}' (length: {len(OPENROUTER_API_KEY)})")
+
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OpenRouter API key is missing or empty")
+
     payload = {
         "model": model,
         "messages": [
@@ -161,7 +167,6 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
     return chunks
 
 # --- Simple embedding (hash-based) ---
-
 def get_simple_embedding(text: str) -> List[float]:
     text = text.lower().strip()
     embeddings = []
