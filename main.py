@@ -1,4 +1,4 @@
-# main.py - Railway deployment for Insurance Policy RAG API using Gemini 2.0 Flash via OpenRouter and your Pinecone API key
+# main.py - Railway deployment for Insurance Policy RAG API using Horizon Beta via OpenRouter and your Pinecone API key
 
 import os
 from typing import List
@@ -19,10 +19,10 @@ import docx
 from pinecone import Pinecone, ServerlessSpec
 
 # --- API KEYS: Set them here directly ---
-OPENROUTER_API_KEY = "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".strip()
+OPENROUTER_API_KEY = "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".strip()
 PINECONE_API_KEY = "pcsk_2HMPt3_6R2wiF8G1zmHjMaAQmJh69wEFDD16YtJkk3YrTC9wvTD5EiaLVZpLve4Up8nFbt".strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
+OPENROUTER_MODEL = "openrouter/horizon-beta"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +46,7 @@ initialization_status = {
     "error": None
 }
 
-# --- LLM via OpenRouter Gemini 2.0 Flash ---
+# --- LLM via OpenRouter ---
 def query_openrouter(prompt: str, model=OPENROUTER_MODEL, max_tokens=1024, temperature=0.0) -> str:
     # Debug print to verify API key presence
     logger.debug(f"Using OpenRouter API Key: '{OPENROUTER_API_KEY}' (length: {len(OPENROUTER_API_KEY)})")
