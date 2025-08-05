@@ -19,11 +19,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# --- ADDED: Copy your application code and documents to the builder stage ---
+# Copy your application code and documents to the builder stage
 COPY main.py .
 COPY policy.pdf .
-# -------------------------------------------------------------------------
-
 
 # Stage 2: The final, smaller image
 # Use the slim Python image to reduce the final image size
@@ -37,7 +35,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Copy only the necessary files from the builder stage
-# This includes the installed Python packages, your application code, and the policy document
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /app/main.py .
 COPY --from=builder /app/policy.pdf .
