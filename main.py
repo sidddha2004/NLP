@@ -219,7 +219,8 @@ def initialize_pinecone():
             logger.info("Pinecone client initialized")
         if index is None:
             index_name = "policy-docs-gemini-hash"  # Match Phase 1 index name
-            existing_indexes = pc.list_indexes()
+            existing_indexes = [idx.name for idx in pc.list_indexes()]
+            logger.info(f"Available indexes: {existing_indexes}")
             if index_name not in existing_indexes:
                 raise ValueError(f"Pinecone index '{index_name}' not found. Populate Phase 1 first.")
             index = pc.Index(index_name)
