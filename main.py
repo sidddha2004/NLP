@@ -1,4 +1,6 @@
 # phase2_query_service.py - Improved Query Service for Insurance Policy RAG
+# Updated with async client cleanup, graceful startup error handling,
+# consistent env vars, configurable model name, and index existence check.
 
 import os
 import hashlib
@@ -11,7 +13,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pinecone import Pinecone
+from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai  # sync SDK, but async Gemini calls via httpx
 
 # Setup logging
@@ -28,11 +30,15 @@ OPENAI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = OPENAI_API_KEY.strip() if OPENAI_API_KEY else None
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_API_KEY = PINECONE_API_KEY.strip() if PINECONE_API_KEY else None
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash")
 
 if not OPENAI_API_KEY:
     logger.error("GEMINI_API_KEY environment variable is missing!")
 if not PINECONE_API_KEY:
     logger.error("PINECONE_API_KEY environment variable is missing!")
+if not API_BEARER_TOKEN:
+    logger.error("API_BEARER_TOKEN environment variable is missing!")
 
 async_client = httpx.AsyncClient()
 embedding_cache = {}
@@ -46,7 +52,7 @@ async def query_gemini_async(prompt: str) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "google/gemini-2.0-flash",  # Use your correct model here
+        "model": MODEL_NAME,  # Configurable
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1024,
         "temperature": 0.0,
@@ -165,7 +171,7 @@ security = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
-    expected_token = os.getenv("API_BEARER_TOKEN")
+    expected_token = API_BEARER_TOKEN
     if not expected_token:
         logger.error("API_BEARER_TOKEN not configured")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -197,11 +203,10 @@ def initialize_gemini():
     global gemini_model
     try:
         if gemini_model is None:
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
+            if not OPENAI_API_KEY:
                 raise ValueError("GEMINI_API_KEY env var not set")
-            genai.configure(api_key=api_key)
-            gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            genai.configure(api_key=OPENAI_API_KEY)
+            gemini_model = genai.GenerativeModel(MODEL_NAME)
             logger.info("Gemini model initialized")
         return gemini_model
     except Exception as e:
@@ -212,13 +217,12 @@ def initialize_pinecone():
     global pc, index
     try:
         if pc is None:
-            api_key = os.getenv("PINECONE_API_KEY")
-            if not api_key:
+            if not PINECONE_API_KEY:
                 raise ValueError("PINECONE_API_KEY env var not set")
-            pc = Pinecone(api_key=api_key)
+            pc = Pinecone(api_key=PINECONE_API_KEY)
             logger.info("Pinecone client initialized")
         if index is None:
-            index_name = "policy-docs-gemini-hash"  # Match Phase 1 index name
+            index_name = "policy-docs-gemini-hash"
             existing_indexes = [idx.name for idx in pc.list_indexes()]
             logger.info(f"Available indexes: {existing_indexes}")
             if index_name not in existing_indexes:
@@ -238,8 +242,18 @@ def initialize_pinecone():
 async def startup_event():
     global gemini_model, pc, index
     logger.info("=== Starting up Query Service ===")
-    gemini_model = initialize_gemini()
-    pc, index = initialize_pinecone()
+    try:
+        gemini_model = initialize_gemini()
+        pc, index = initialize_pinecone()
+        initialization_status["gemini"] = True
+        initialization_status["pinecone"] = True
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
+        initialization_status["error"] = str(e)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await async_client.aclose()
 
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
