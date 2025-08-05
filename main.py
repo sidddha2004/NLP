@@ -6,6 +6,7 @@ import time
 import hashlib
 import traceback
 import logging
+import asyncio
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,7 @@ initialization_status = {
     "gemini": False,
     "pinecone": False,
     "document": False,
+    "document_processing": False,
     "error": None
 }
 
@@ -106,7 +108,7 @@ def init_pinecone():
                     
                     # Wait for index to be ready
                     logger.info("⏳ Waiting for index to be ready...")
-                    max_retries = 60
+                    max_retries = 30  # Reduced from 60
                     retry_count = 0
                     while retry_count < max_retries:
                         try:
@@ -116,7 +118,7 @@ def init_pinecone():
                             logger.warning(f"Waiting for index, attempt {retry_count}: {wait_error}")
                         time.sleep(2)
                         retry_count += 1
-                        if retry_count % 10 == 0:
+                        if retry_count % 5 == 0:  # Reduced logging frequency
                             logger.info(f"Still waiting... ({retry_count}/{max_retries})")
                     
                     if retry_count >= max_retries:
@@ -252,8 +254,35 @@ def get_simple_embedding(text: str) -> List[float]:
         return [0.0] * 512
 
 # Alternative: Use Gemini for embeddings (API-based, no local ML dependencies)
-def get_gemini_embedding(text: str, gemini_model) -> List[float]:
+async def get_gemini_embedding_async(text: str, gemini_model) -> List[float]:
     """Use Gemini to create embeddings via API - EXACTLY 512 dimensions"""
+    try:
+        # Use Gemini to generate a semantic representation
+        prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
+        response = gemini_model.generate_content(prompt)
+        keywords = response.text.strip()
+        
+        # Convert keywords to embedding using simple hashing
+        embedding = get_simple_embedding(keywords)
+        
+        # Double check dimensions
+        if len(embedding) != 512:
+            logger.warning(f"Gemini embedding has {len(embedding)} dimensions, expected 512")
+            # Pad or truncate to exactly 512
+            if len(embedding) < 512:
+                embedding.extend([0.0] * (512 - len(embedding)))
+            else:
+                embedding = embedding[:512]
+        
+        return embedding
+        
+    except Exception as e:
+        logger.error(f"Error getting Gemini embedding: {e}")
+        # Fallback to simple embedding
+        return get_simple_embedding(text)
+
+def get_gemini_embedding(text: str, gemini_model) -> List[float]:
+    """Synchronous wrapper for Gemini embeddings"""
     try:
         # Use Gemini to generate a semantic representation
         prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
@@ -321,20 +350,62 @@ def query_chunks(query: str, index, gemini_model, top_k: int = 5) -> List[str]:
         logger.error(f"Error querying chunks: {e}")
         return []
 
-# Pinecone upsert functions
+# Pinecone upsert functions - now with batching and rate limiting
+async def upsert_chunks_async(chunks: List[str], index, gemini_model):
+    """Async version with rate limiting and batching"""
+    try:
+        vectors = []
+        batch_size = 10  # Smaller batches for processing
+        
+        logger.info(f"Processing {len(chunks)} chunks in batches of {batch_size}")
+        
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_vectors = []
+            
+            for j, chunk in enumerate(batch_chunks):
+                try:
+                    # Use simple embeddings primarily to avoid API rate limits
+                    embedding = get_simple_embedding(chunk)
+                    
+                    if embedding is not None:
+                        batch_vectors.append({
+                            "id": f"chunk-{i+j}-{int(time.time())}",
+                            "values": embedding,
+                            "metadata": {"text": chunk}
+                        })
+                except Exception as chunk_error:
+                    logger.warning(f"Error processing chunk {i+j}: {chunk_error}")
+                    continue
+            
+            # Upsert this batch
+            if batch_vectors:
+                try:
+                    index.upsert(vectors=batch_vectors)
+                    logger.info(f"✓ Upserted batch {i//batch_size + 1}/{(len(chunks)-1)//batch_size + 1} ({len(batch_vectors)} vectors)")
+                except Exception as upsert_error:
+                    logger.error(f"Error upserting batch: {upsert_error}")
+            
+            # Small delay between batches to avoid overwhelming the API
+            await asyncio.sleep(0.5)
+        
+        logger.info(f"✓ Completed upserting all chunks")
+        
+    except Exception as e:
+        logger.error(f"Error in async upsert: {e}")
+        raise e
+
 def upsert_chunks(chunks: List[str], index, gemini_model):
+    """Synchronous version for compatibility"""
     try:
         vectors = []
         for i, chunk in enumerate(chunks):
-            # Try Gemini-based embedding first, fallback to simple embedding
-            try:
-                embedding = get_gemini_embedding(chunk, gemini_model)
-            except:
-                embedding = get_simple_embedding(chunk)
+            # Use simple embeddings to avoid API rate limits during sync processing
+            embedding = get_simple_embedding(chunk)
                 
             if embedding is not None:
                 vectors.append({
-                    "id": f"chunk-{i}-{int(time.time())}",  # Add timestamp to avoid ID conflicts
+                    "id": f"chunk-{i}-{int(time.time())}",
                     "values": embedding,
                     "metadata": {"text": chunk}
                 })
@@ -350,12 +421,15 @@ def upsert_chunks(chunks: List[str], index, gemini_model):
         logger.error(f"Error upserting chunks: {e}")
         raise e
 
-# Initialize policy document function
-def initialize_policy_document():
-    """Extract and upsert the policy.pdf document once at startup"""
+# Background task for document processing
+async def process_documents_background():
+    """Process documents in the background after startup"""
     global index, gemini_model, initialization_status
     
     try:
+        logger.info("🔄 Starting background document processing...")
+        initialization_status["document_processing"] = True
+        
         policy_file = "policy.pdf"
         
         # Debug: List all files in current directory
@@ -365,6 +439,7 @@ def initialize_policy_document():
         if not os.path.exists(policy_file):
             logger.error(f"Policy file {policy_file} not found in {os.getcwd()}")
             logger.error(f"Available files: {os.listdir('.')}")
+            initialization_status["document_processing"] = False
             return
         
         # Check file permissions and size
@@ -388,22 +463,24 @@ def initialize_policy_document():
                 logger.info("Clearing existing vectors from index...")
                 index.delete(delete_all=True)
                 logger.info("Cleared existing vectors from index")
-                time.sleep(5)  # Wait a bit after clearing
+                await asyncio.sleep(5)  # Wait a bit after clearing
             else:
                 logger.info("Index is empty, no need to clear")
         except Exception as e:
             logger.warning(f"Could not check/clear index stats: {e}")
             logger.info("Proceeding with upsert...")
         
-        # Upsert chunks to Pinecone
-        upsert_chunks(chunks, index, gemini_model)
-        logger.info("Policy document successfully indexed")
+        # Upsert chunks to Pinecone (async with rate limiting)
+        await upsert_chunks_async(chunks, index, gemini_model)
+        logger.info("✅ Policy document successfully indexed in background")
         initialization_status["document"] = True
+        initialization_status["document_processing"] = False
         
     except Exception as e:
-        logger.error(f"Error initializing policy document: {e}")
+        logger.error(f"❌ Error in background document processing: {e}")
+        logger.error(traceback.format_exc())
         initialization_status["error"] = str(e)
-        raise e
+        initialization_status["document_processing"] = False
 
 security = HTTPBearer()
 
@@ -432,31 +509,28 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# Initialize services once at startup for Railway
+# FIXED: Non-blocking startup event
 @app.on_event("startup")
 async def startup_event():
     global gemini_model, pc, index, initialization_status
     
-    logger.info("=== STARTUP: Initializing services ===")
+    logger.info("=== STARTUP: Initializing core services ===")
     
     try:
-        # Initialize Gemini
+        # Initialize Gemini (fast)
         gemini_model = initialize_services()
         logger.info("✓ Gemini initialized successfully")
         
-        # Initialize Pinecone
+        # Initialize Pinecone (fast)
         pc, index = init_pinecone()
         logger.info("✓ Pinecone initialized successfully")
         
-        # Initialize policy document if available (non-blocking)
-        try:
-            initialize_policy_document()
-            logger.info("✓ Policy document initialized successfully")
-        except Exception as doc_error:
-            logger.warning(f"⚠ Policy document initialization failed: {doc_error}")
-            logger.info("Continuing without document...")
+        logger.info("=== CORE STARTUP COMPLETE ===")
+        logger.info("🚀 Server is ready to accept requests")
         
-        logger.info("=== STARTUP COMPLETE ===")
+        # Start document processing in background (non-blocking)
+        logger.info("🔄 Starting document processing in background...")
+        asyncio.create_task(process_documents_background())
         
     except Exception as e:
         logger.error(f"❌ STARTUP ERROR: {e}")
@@ -478,6 +552,10 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
             detail=f"Services not properly initialized. Status: {initialization_status}"
         )
     
+    # Check if document is still processing
+    if initialization_status["document_processing"]:
+        logger.info("Document still processing, but can answer with available data")
+    
     answers = []
     
     for question in req.questions:
@@ -486,7 +564,12 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
             relevant_clauses = query_chunks(question, index, gemini_model)
             
             if not relevant_clauses:
-                answers.append("No relevant information found in the policy document for this question.")
+                if initialization_status["document_processing"]:
+                    answers.append("Document is still being processed. Please try again in a few moments.")
+                elif not initialization_status["document"]:
+                    answers.append("Policy document not yet available. Please contact support.")
+                else:
+                    answers.append("No relevant information found in the policy document for this question.")
                 continue
             
             answer = query_gemini(question, relevant_clauses, gemini_model)
@@ -500,6 +583,7 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint - always responds quickly"""
     return {
         "status": "healthy", 
         "message": "Insurance Policy RAG API with Gemini is running",
@@ -511,6 +595,34 @@ async def health_check():
             "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
         }
     }
+
+@app.get("/status")
+async def get_detailed_status():
+    """Detailed status endpoint"""
+    global index
+    try:
+        status_info = {
+            "services": initialization_status,
+            "server_ready": bool(gemini_model and index),
+            "document_ready": initialization_status["document"],
+            "document_processing": initialization_status["document_processing"]
+        }
+        
+        if index:
+            try:
+                stats = index.describe_index_stats()
+                status_info["vector_stats"] = {
+                    "total_vectors": stats.total_vector_count,
+                    "index_fullness": stats.index_fullness
+                }
+            except Exception as stats_error:
+                status_info["vector_stats"] = {"error": str(stats_error)}
+        
+        return status_info
+        
+    except Exception as e:
+        logger.error(f"Error getting detailed status: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/info")
 async def get_info():
@@ -539,6 +651,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "health": "/health",
+            "status": "/status",
             "info": "/info",
             "query": "/hackrx/run (POST)"
         }
