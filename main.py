@@ -50,7 +50,7 @@ initialization_status = {
 
 # Hugging Face API configuration
 HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
-HF_EMBEDDING_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+HF_EMBEDDING_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 
 # Initialize AI models and services
 def initialize_services():
@@ -250,42 +250,76 @@ def get_simple_embedding(text: str) -> List[float]:
 
 # Hugging Face API call for embeddings
 def get_hf_embedding(text: str, hf_api_key: str) -> List[float]:
-    """Use Hugging Face API to create embeddings - 384 dimensions"""
+    """Use Hugging Face API for feature extraction embeddings - 384 dimensions"""
     try:
-        headers = {"Authorization": f"Bearer {hf_api_key}"}
+        headers = {
+            "Authorization": f"Bearer {hf_api_key}",
+            "Content-Type": "application/json"
+        }
         
-        # Truncate text if too long
-        text = text[:500]  # Limit text length for API
+        # Truncate text if too long and clean it
+        text = text.strip()[:512]  # Limit text length for API
+        if not text:
+            return get_simple_embedding("empty text")
         
-        response = requests.post(
-            HF_EMBEDDING_URL,
-            headers=headers,
-            json={"inputs": text},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            embedding = response.json()
-            if isinstance(embedding, list) and len(embedding) > 0:
-                # Handle different response formats
-                if isinstance(embedding[0], list):
-                    embedding = embedding[0]  # Take first embedding if batch
+        # Try multiple API approaches with retries
+        for attempt in range(3):
+            try:
+                # Method 1: Feature extraction pipeline
+                response = requests.post(
+                    HF_EMBEDDING_URL,
+                    headers=headers,
+                    json={"inputs": text},
+                    timeout=45  # Increased timeout
+                )
                 
-                # Ensure exactly 384 dimensions
-                if len(embedding) == 384:
-                    return embedding
-                elif len(embedding) > 384:
-                    return embedding[:384]
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Handle different response formats
+                    embedding = None
+                    if isinstance(result, list):
+                        if len(result) > 0:
+                            if isinstance(result[0], list):
+                                embedding = result[0]  # Single text embedding
+                            elif isinstance(result[0], (int, float)):
+                                embedding = result  # Direct embedding list
+                    
+                    if embedding and len(embedding) >= 300:  # Reasonable embedding size
+                        # Ensure exactly 384 dimensions
+                        if len(embedding) == 384:
+                            return embedding
+                        elif len(embedding) > 384:
+                            return embedding[:384]
+                        else:
+                            # Pad if smaller
+                            embedding.extend([0.0] * (384 - len(embedding)))
+                            return embedding
+                
+                elif response.status_code == 503:
+                    # Model loading, wait and retry
+                    logger.info(f"Model loading, waiting... (attempt {attempt + 1})")
+                    time.sleep(10 * (attempt + 1))
+                    continue
                 else:
-                    # Pad if smaller
-                    embedding.extend([0.0] * (384 - len(embedding)))
-                    return embedding
-            else:
-                logger.warning("Invalid embedding format from HF API")
-                return get_simple_embedding(text)
-        else:
-            logger.warning(f"HF API error: {response.status_code} - {response.text}")
-            return get_simple_embedding(text)
+                    logger.warning(f"HF API error: {response.status_code} - {response.text}")
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"HF API timeout on attempt {attempt + 1}")
+                time.sleep(5)
+                continue
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"HF API connection error on attempt {attempt + 1}")
+                time.sleep(5)
+                continue
+            except Exception as e:
+                logger.warning(f"HF API attempt {attempt + 1} failed: {e}")
+                time.sleep(2)
+                continue
+        
+        # If all attempts failed, use fallback
+        logger.info("All HF API attempts failed, using simple embedding fallback")
+        return get_simple_embedding(text)
             
     except Exception as e:
         logger.error(f"Error getting HF embedding: {e}")
@@ -293,7 +327,7 @@ def get_hf_embedding(text: str, hf_api_key: str) -> List[float]:
 
 # Hugging Face API call for text generation
 def query_huggingface(question: str, context_clauses: List[str], hf_api_key: str) -> str:
-    """Use Hugging Face API for text generation"""
+    """Use Hugging Face API for text generation with improved error handling"""
     
     # Create a focused prompt
     context = "\n".join([f"- {clause[:200]}" for clause in context_clauses[:3]])  # Limit context
@@ -308,7 +342,10 @@ Policy Clauses:
 Provide a clear, specific answer citing the relevant clauses. [/INST]"""
     
     try:
-        headers = {"Authorization": f"Bearer {hf_api_key}"}
+        headers = {
+            "Authorization": f"Bearer {hf_api_key}",
+            "Content-Type": "application/json"
+        }
         
         payload = {
             "inputs": prompt,
@@ -321,23 +358,50 @@ Provide a clear, specific answer citing the relevant clauses. [/INST]"""
             }
         }
         
-        response = requests.post(
-            HF_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                generated_text = result[0].get("generated_text", "")
-                return generated_text.strip()
-            else:
-                return "Error: Invalid response format from Hugging Face API"
-        else:
-            logger.error(f"HF API error: {response.status_code} - {response.text}")
-            return f"Error: Failed to get response from Hugging Face API (Status: {response.status_code})"
+        # Try with retries
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    HF_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=90  # Increased timeout for text generation
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if isinstance(result, list) and len(result) > 0:
+                        generated_text = result[0].get("generated_text", "")
+                        if generated_text.strip():
+                            return generated_text.strip()
+                    return "Error: Invalid response format from Hugging Face API"
+                    
+                elif response.status_code == 503:
+                    # Model loading, wait and retry
+                    logger.info(f"Model loading for text generation, waiting... (attempt {attempt + 1})")
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                else:
+                    logger.error(f"HF API error: {response.status_code} - {response.text}")
+                    if attempt == 2:  # Last attempt
+                        return f"Error: Failed to get response from Hugging Face API (Status: {response.status_code})"
+                    time.sleep(5)
+                    continue
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"HF text generation timeout on attempt {attempt + 1}")
+                if attempt == 2:
+                    return "Error: Request timed out. Please try again."
+                time.sleep(10)
+                continue
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"HF text generation connection error on attempt {attempt + 1}")
+                if attempt == 2:
+                    return "Error: Connection failed. Please try again."
+                time.sleep(10)
+                continue
+                
+        return "Error: All attempts to generate response failed"
             
     except Exception as e:
         logger.error(f"Error generating HF response: {e}")
@@ -366,28 +430,51 @@ def query_chunks(query: str, index, hf_api_key: str, top_k: int = 5) -> List[str
 def upsert_chunks(chunks: List[str], index, hf_api_key: str):
     try:
         vectors = []
+        successful_embeddings = 0
+        failed_embeddings = 0
+        
+        logger.info(f"Starting to process {len(chunks)} chunks for embeddings...")
+        
         for i, chunk in enumerate(chunks):
+            if i % 10 == 0:
+                logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+            
             embedding = get_hf_embedding(chunk, hf_api_key)
                 
-            if embedding is not None:
+            if embedding is not None and len(embedding) == 384:
                 vectors.append({
                     "id": f"chunk-{i}-{int(time.time())}",
                     "values": embedding,
                     "metadata": {"text": chunk}
                 })
+                successful_embeddings += 1
+            else:
+                failed_embeddings += 1
+                logger.warning(f"Failed to get embedding for chunk {i}")
             
-            # Add delay to avoid rate limiting
-            if i % 10 == 0:
-                time.sleep(1)
+            # Add delay to avoid rate limiting - HF has rate limits
+            if i % 5 == 0 and i > 0:
+                time.sleep(2)  # 2 second delay every 5 chunks
         
-        # Upsert in batches
-        batch_size = 50  # Smaller batches for stability
+        logger.info(f"Embedding summary: {successful_embeddings} successful, {failed_embeddings} failed")
+        
+        if not vectors:
+            raise Exception("No valid embeddings generated")
+        
+        # Upsert in smaller batches for stability
+        batch_size = 25  # Even smaller batches
         for i in range(0, len(vectors), batch_size):
             batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch)
-            time.sleep(0.5)  # Small delay between batches
+            try:
+                index.upsert(vectors=batch)
+                logger.info(f"Upserted batch {i//batch_size + 1}/{(len(vectors) + batch_size - 1)//batch_size}")
+                time.sleep(1)  # 1 second delay between batches
+            except Exception as batch_error:
+                logger.error(f"Error upserting batch {i//batch_size + 1}: {batch_error}")
+                # Continue with next batch instead of failing completely
+                continue
         
-        logger.info(f"Upserted {len(chunks)} chunks to Pinecone.")
+        logger.info(f"Successfully upserted {len(vectors)} chunks to Pinecone.")
     except Exception as e:
         logger.error(f"Error upserting chunks: {e}")
         raise e
