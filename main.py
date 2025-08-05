@@ -1,4 +1,4 @@
-# main.py - Fixed Railway deployment for Insurance Policy RAG API with Hugging Face
+# main.py - Fixed Railway deployment for Insurance Policy RAG API
 
 import os
 from typing import List
@@ -6,7 +6,6 @@ import time
 import hashlib
 import traceback
 import logging
-import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -24,10 +23,10 @@ import docx
 
 # AI and vector database
 from pinecone import Pinecone, ServerlessSpec
-import requests
+import google.generativeai as genai
 
 # FastAPI setup
-app = FastAPI(title="Insurance Policy RAG API with Hugging Face", version="1.0.0")
+app = FastAPI(title="Insurance Policy RAG API with Gemini", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,37 +37,35 @@ app.add_middleware(
 )
 
 # Global variables for models
-hf_api_key = None
+gemini_model = None
 pc = None
 index = None
 initialization_status = {
-    "huggingface": False,
+    "gemini": False,
     "pinecone": False,
     "document": False,
     "error": None
 }
 
-# Hugging Face API configuration
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
-HF_EMBEDDING_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-
 # Initialize AI models and services
 def initialize_services():
-    global hf_api_key, initialization_status
+    global gemini_model, initialization_status
     
     try:
-        if hf_api_key is None:
-            api_key = os.getenv("HUGGINGFACE_API_KEY")
+        if gemini_model is None:
+            api_key = os.getenv("GEMINI_API_KEY")
             if not api_key:
-                raise ValueError("HUGGINGFACE_API_KEY environment variable not set")
+                raise ValueError("GEMINI_API_KEY environment variable not set")
             
-            hf_api_key = api_key
-            logger.info("Hugging Face API key initialized successfully")
-            initialization_status["huggingface"] = True
+            # Configure Gemini
+            genai.configure(api_key=api_key)
+            gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+            logger.info("Gemini model initialized successfully")
+            initialization_status["gemini"] = True
         
-        return hf_api_key
+        return gemini_model
     except Exception as e:
-        logger.error(f"Failed to initialize Hugging Face: {e}")
+        logger.error(f"Failed to initialize Gemini: {e}")
         initialization_status["error"] = str(e)
         raise e
 
@@ -87,7 +84,7 @@ def init_pinecone():
             logger.info("✓ Pinecone client initialized")
         
         if index is None:
-            index_name = "policy-docs-hf-embeddings"
+            index_name = "policy-docs-gemini-hash"
             
             # Check if index exists
             try:
@@ -98,7 +95,7 @@ def init_pinecone():
                     logger.info(f"🏗 Creating new index: {index_name}")
                     pc.create_index(
                         name=index_name,
-                        dimension=384,  # Using sentence-transformers/all-MiniLM-L6-v2 embeddings
+                        dimension=512,  # Using simple hash-based embeddings
                         metric="cosine",
                         spec=ServerlessSpec(
                             cloud="aws",
@@ -185,233 +182,131 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
         start = end - overlap if end - overlap > start else end
     return chunks
 
-# Simple embedding function using text hashing (fallback)
+# Simple embedding function using text hashing (no ML dependencies)
 def get_simple_embedding(text: str) -> List[float]:
-    """Create a simple embedding using text hashing - EXACTLY 384 dimensions for fallback"""
+    """Create a simple embedding using text hashing and basic features - EXACTLY 512 dimensions"""
     try:
+        # Normalize text
         text = text.lower().strip()
         embeddings = []
         
-        # Hash-based features (192 dimensions)
-        for i in range(12):  # 12 hash iterations
+        # Method 1: Hash-based features (256 dimensions)
+        for i in range(16):  # 16 hash iterations
             hash_obj = hashlib.md5(f"{text}_{i}".encode())
             hash_bytes = hash_obj.digest()
+            # Each MD5 gives 16 bytes = 16 values
             for byte_val in hash_bytes:
-                if len(embeddings) < 192:
-                    normalized_val = (byte_val / 255.0) * 2 - 1
+                if len(embeddings) < 256:
+                    normalized_val = (byte_val / 255.0) * 2 - 1  # Normalize to [-1, 1]
                     embeddings.append(normalized_val)
         
-        # Word-based features (192 dimensions)
+        # Method 2: Word-based features (256 dimensions)
         words = text.split()
         word_features = []
         
-        # Basic text statistics
+        # Basic text statistics (first 10 features)
         word_features.extend([
-            len(text) / 1000.0,
-            len(words) / 100.0,
-            sum(len(word) for word in words) / max(len(words), 1) / 10.0,
-            len(set(words)) / max(len(words), 1),
-            text.count(' ') / max(len(text), 1),
-            text.count('.') / max(len(text), 1),
-            text.count(',') / max(len(text), 1),
-            sum(1 for c in text if c.isupper()) / max(len(text), 1),
-            sum(1 for c in text if c.isdigit()) / max(len(text), 1),
-            len([w for w in words if len(w) > 5]) / max(len(words), 1)
+            len(text) / 1000.0,  # Text length
+            len(words) / 100.0,  # Word count
+            sum(len(word) for word in words) / max(len(words), 1) / 10.0,  # Avg word length
+            len(set(words)) / max(len(words), 1),  # Unique word ratio
+            text.count(' ') / max(len(text), 1),  # Space ratio
+            text.count('.') / max(len(text), 1),  # Period ratio
+            text.count(',') / max(len(text), 1),  # Comma ratio
+            sum(1 for c in text if c.isupper()) / max(len(text), 1),  # Uppercase ratio
+            sum(1 for c in text if c.isdigit()) / max(len(text), 1),  # Digit ratio
+            len([w for w in words if len(w) > 5]) / max(len(words), 1)  # Long word ratio
         ])
         
-        # Hash features for remaining dimensions
-        for i in range(182):  # 192 - 10 = 182
+        # Hash each word to create remaining features (246 more features)
+        for i in range(246):
             if i < len(words):
                 word_hash = hash(f"{words[i]}_{i}") % 10000
                 word_features.append(word_hash / 10000.0)
             else:
+                # If we run out of words, use character-based hashes
                 if i < len(text):
                     char_hash = hash(f"{text[i]}_{i}") % 10000
                     word_features.append(char_hash / 10000.0)
                 else:
                     word_features.append(0.0)
         
-        word_features = word_features[:192]
-        while len(word_features) < 192:
+        # Ensure exactly 256 word features
+        word_features = word_features[:256]
+        while len(word_features) < 256:
             word_features.append(0.0)
         
+        # Combine both feature sets
         embeddings.extend(word_features)
         
-        # Ensure exactly 384 dimensions
-        embeddings = embeddings[:384]
-        while len(embeddings) < 384:
+        # Final check: ensure exactly 512 dimensions
+        embeddings = embeddings[:512]
+        while len(embeddings) < 512:
             embeddings.append(0.0)
             
         return embeddings
         
     except Exception as e:
-        logger.error(f"Error creating simple embedding: {e}")
-        return [0.0] * 384
+        logger.error(f"Error creating embedding: {e}")
+        # Return zero vector if error
+        return [0.0] * 512
 
-# Hugging Face API call for embeddings
-def get_hf_embedding(text: str, hf_api_key: str) -> List[float]:
-    """Use Hugging Face API for feature extraction embeddings - 384 dimensions"""
+# Alternative: Use Gemini for embeddings (API-based, no local ML dependencies)
+def get_gemini_embedding(text: str, gemini_model) -> List[float]:
+    """Use Gemini to create embeddings via API - EXACTLY 512 dimensions"""
     try:
-        headers = {
-            "Authorization": f"Bearer {hf_api_key}",
-            "Content-Type": "application/json"
-        }
+        # Use Gemini to generate a semantic representation
+        prompt = f"Create a semantic summary of this text in exactly 50 keywords, separated by commas: {text[:1000]}"
+        response = gemini_model.generate_content(prompt)
+        keywords = response.text.strip()
         
-        # Truncate text if too long and clean it
-        text = text.strip()[:512]  # Limit text length for API
-        if not text:
-            return get_simple_embedding("empty text")
+        # Convert keywords to embedding using simple hashing
+        embedding = get_simple_embedding(keywords)
         
-        # Try multiple API approaches with retries
-        for attempt in range(3):
-            try:
-                # Method 1: Feature extraction pipeline
-                response = requests.post(
-                    HF_EMBEDDING_URL,
-                    headers=headers,
-                    json={"inputs": text},
-                    timeout=45  # Increased timeout
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    # Handle different response formats
-                    embedding = None
-                    if isinstance(result, list):
-                        if len(result) > 0:
-                            if isinstance(result[0], list):
-                                embedding = result[0]  # Single text embedding
-                            elif isinstance(result[0], (int, float)):
-                                embedding = result  # Direct embedding list
-                    
-                    if embedding and len(embedding) >= 300:  # Reasonable embedding size
-                        # Ensure exactly 384 dimensions
-                        if len(embedding) == 384:
-                            return embedding
-                        elif len(embedding) > 384:
-                            return embedding[:384]
-                        else:
-                            # Pad if smaller
-                            embedding.extend([0.0] * (384 - len(embedding)))
-                            return embedding
-                
-                elif response.status_code == 503:
-                    # Model loading, wait and retry
-                    logger.info(f"Model loading, waiting... (attempt {attempt + 1})")
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                else:
-                    logger.warning(f"HF API error: {response.status_code} - {response.text}")
-                    
-            except requests.exceptions.Timeout:
-                logger.warning(f"HF API timeout on attempt {attempt + 1}")
-                time.sleep(5)
-                continue
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"HF API connection error on attempt {attempt + 1}")
-                time.sleep(5)
-                continue
-            except Exception as e:
-                logger.warning(f"HF API attempt {attempt + 1} failed: {e}")
-                time.sleep(2)
-                continue
+        # Double check dimensions
+        if len(embedding) != 512:
+            logger.warning(f"Gemini embedding has {len(embedding)} dimensions, expected 512")
+            # Pad or truncate to exactly 512
+            if len(embedding) < 512:
+                embedding.extend([0.0] * (512 - len(embedding)))
+            else:
+                embedding = embedding[:512]
         
-        # If all attempts failed, use fallback
-        logger.info("All HF API attempts failed, using simple embedding fallback")
-        return get_simple_embedding(text)
-            
+        return embedding
+        
     except Exception as e:
-        logger.error(f"Error getting HF embedding: {e}")
+        logger.error(f"Error getting Gemini embedding: {e}")
+        # Fallback to simple embedding
         return get_simple_embedding(text)
 
-# Hugging Face API call for text generation
-def query_huggingface(question: str, context_clauses: List[str], hf_api_key: str) -> str:
-    """Use Hugging Face API for text generation with improved error handling"""
-    
-    # Create a focused prompt
-    context = "\n".join([f"- {clause[:200]}" for clause in context_clauses[:3]])  # Limit context
-    
-    prompt = f"""<s>[INST] You are an expert insurance assistant. Answer the question using only the provided policy clauses.
+def query_gemini(question: str, context_clauses: List[str], gemini_model) -> str:
+    prompt = f"""
+You are an expert assistant who answers insurance policy questions precisely and cites the clauses.
 
 Question: {question}
 
-Policy Clauses:
-{context}
+Use ONLY the following clauses and explicitly mention or quote them in your answer:
 
-Provide a clear, specific answer citing the relevant clauses. [/INST]"""
+{chr(10).join([f"- {clause}" for clause in context_clauses])}
+
+Answer:
+"""
     
     try:
-        headers = {
-            "Authorization": f"Bearer {hf_api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": 300,
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "do_sample": True,
-                "return_full_text": False
-            }
-        }
-        
-        # Try with retries
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    HF_API_URL,
-                    headers=headers,
-                    json=payload,
-                    timeout=90  # Increased timeout for text generation
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        generated_text = result[0].get("generated_text", "")
-                        if generated_text.strip():
-                            return generated_text.strip()
-                    return "Error: Invalid response format from Hugging Face API"
-                    
-                elif response.status_code == 503:
-                    # Model loading, wait and retry
-                    logger.info(f"Model loading for text generation, waiting... (attempt {attempt + 1})")
-                    time.sleep(15 * (attempt + 1))
-                    continue
-                else:
-                    logger.error(f"HF API error: {response.status_code} - {response.text}")
-                    if attempt == 2:  # Last attempt
-                        return f"Error: Failed to get response from Hugging Face API (Status: {response.status_code})"
-                    time.sleep(5)
-                    continue
-                    
-            except requests.exceptions.Timeout:
-                logger.warning(f"HF text generation timeout on attempt {attempt + 1}")
-                if attempt == 2:
-                    return "Error: Request timed out. Please try again."
-                time.sleep(10)
-                continue
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"HF text generation connection error on attempt {attempt + 1}")
-                if attempt == 2:
-                    return "Error: Connection failed. Please try again."
-                time.sleep(10)
-                continue
-                
-        return "Error: All attempts to generate response failed"
-            
+        response = gemini_model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        logger.error(f"Error generating HF response: {e}")
+        logger.error(f"Error generating Gemini response: {e}")
         return f"Error generating response: {str(e)}"
 
 # Pinecone operations
-def query_chunks(query: str, index, hf_api_key: str, top_k: int = 5) -> List[str]:
+def query_chunks(query: str, index, gemini_model, top_k: int = 5) -> List[str]:
     try:
-        # Get embedding for query
-        query_embedding = get_hf_embedding(query, hf_api_key)
+        # Try Gemini-based embedding first, fallback to simple embedding
+        try:
+            query_embedding = get_gemini_embedding(query, gemini_model)
+        except:
+            query_embedding = get_simple_embedding(query)
         
         if not query_embedding:
             return []
@@ -427,54 +322,30 @@ def query_chunks(query: str, index, hf_api_key: str, top_k: int = 5) -> List[str
         return []
 
 # Pinecone upsert functions
-def upsert_chunks(chunks: List[str], index, hf_api_key: str):
+def upsert_chunks(chunks: List[str], index, gemini_model):
     try:
         vectors = []
-        successful_embeddings = 0
-        failed_embeddings = 0
-        
-        logger.info(f"Starting to process {len(chunks)} chunks for embeddings...")
-        
         for i, chunk in enumerate(chunks):
-            if i % 10 == 0:
-                logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-            
-            embedding = get_hf_embedding(chunk, hf_api_key)
+            # Try Gemini-based embedding first, fallback to simple embedding
+            try:
+                embedding = get_gemini_embedding(chunk, gemini_model)
+            except:
+                embedding = get_simple_embedding(chunk)
                 
-            if embedding is not None and len(embedding) == 384:
+            if embedding is not None:
                 vectors.append({
-                    "id": f"chunk-{i}-{int(time.time())}",
+                    "id": f"chunk-{i}-{int(time.time())}",  # Add timestamp to avoid ID conflicts
                     "values": embedding,
                     "metadata": {"text": chunk}
                 })
-                successful_embeddings += 1
-            else:
-                failed_embeddings += 1
-                logger.warning(f"Failed to get embedding for chunk {i}")
-            
-            # Add delay to avoid rate limiting - HF has rate limits
-            if i % 5 == 0 and i > 0:
-                time.sleep(2)  # 2 second delay every 5 chunks
         
-        logger.info(f"Embedding summary: {successful_embeddings} successful, {failed_embeddings} failed")
-        
-        if not vectors:
-            raise Exception("No valid embeddings generated")
-        
-        # Upsert in smaller batches for stability
-        batch_size = 25  # Even smaller batches
+        # Upsert in batches of 100 (Pinecone recommendation)
+        batch_size = 100
         for i in range(0, len(vectors), batch_size):
             batch = vectors[i:i + batch_size]
-            try:
-                index.upsert(vectors=batch)
-                logger.info(f"Upserted batch {i//batch_size + 1}/{(len(vectors) + batch_size - 1)//batch_size}")
-                time.sleep(1)  # 1 second delay between batches
-            except Exception as batch_error:
-                logger.error(f"Error upserting batch {i//batch_size + 1}: {batch_error}")
-                # Continue with next batch instead of failing completely
-                continue
+            index.upsert(vectors=batch)
         
-        logger.info(f"Successfully upserted {len(vectors)} chunks to Pinecone.")
+        logger.info(f"Upserted {len(chunks)} chunks to Pinecone.")
     except Exception as e:
         logger.error(f"Error upserting chunks: {e}")
         raise e
@@ -482,11 +353,12 @@ def upsert_chunks(chunks: List[str], index, hf_api_key: str):
 # Initialize policy document function
 def initialize_policy_document():
     """Extract and upsert the policy.pdf document once at startup"""
-    global index, hf_api_key, initialization_status
+    global index, gemini_model, initialization_status
     
     try:
         policy_file = "policy.pdf"
         
+        # Debug: List all files in current directory
         logger.info(f"Current working directory: {os.getcwd()}")
         logger.info(f"Files in current directory: {os.listdir('.')}")
         
@@ -495,8 +367,9 @@ def initialize_policy_document():
             logger.error(f"Available files: {os.listdir('.')}")
             return
         
+        # Check file permissions and size
         file_stat = os.stat(policy_file)
-        logger.info(f"Policy file found - Size: {file_stat.st_size} bytes")
+        logger.info(f"Policy file found - Size: {file_stat.st_size} bytes, Permissions: {oct(file_stat.st_mode)}")
         
         logger.info(f"Loading policy document: {policy_file}")
         
@@ -515,14 +388,15 @@ def initialize_policy_document():
                 logger.info("Clearing existing vectors from index...")
                 index.delete(delete_all=True)
                 logger.info("Cleared existing vectors from index")
-                time.sleep(5)
+                time.sleep(5)  # Wait a bit after clearing
             else:
                 logger.info("Index is empty, no need to clear")
         except Exception as e:
             logger.warning(f"Could not check/clear index stats: {e}")
+            logger.info("Proceeding with upsert...")
         
         # Upsert chunks to Pinecone
-        upsert_chunks(chunks, index, hf_api_key)
+        upsert_chunks(chunks, index, gemini_model)
         logger.info("Policy document successfully indexed")
         initialization_status["document"] = True
         
@@ -561,14 +435,14 @@ class QueryResponse(BaseModel):
 # Initialize services once at startup for Railway
 @app.on_event("startup")
 async def startup_event():
-    global hf_api_key, pc, index, initialization_status
+    global gemini_model, pc, index, initialization_status
     
     logger.info("=== STARTUP: Initializing services ===")
     
     try:
-        # Initialize Hugging Face
-        hf_api_key = initialize_services()
-        logger.info("✓ Hugging Face initialized successfully")
+        # Initialize Gemini
+        gemini_model = initialize_services()
+        logger.info("✓ Gemini initialized successfully")
         
         # Initialize Pinecone
         pc, index = init_pinecone()
@@ -595,9 +469,9 @@ async def startup_event():
 async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
     
     # Check if services are initialized
-    global hf_api_key, pc, index
+    global gemini_model, pc, index
     
-    if not hf_api_key or not index:
+    if not gemini_model or not index:
         logger.error("Services not properly initialized")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -609,13 +483,13 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
     for question in req.questions:
         try:
             logger.info(f"Processing question: {question[:100]}...")
-            relevant_clauses = query_chunks(question, index, hf_api_key)
+            relevant_clauses = query_chunks(question, index, gemini_model)
             
             if not relevant_clauses:
                 answers.append("No relevant information found in the policy document for this question.")
                 continue
             
-            answer = query_huggingface(question, relevant_clauses, hf_api_key)
+            answer = query_gemini(question, relevant_clauses, gemini_model)
             answers.append(answer)
             
         except Exception as e:
@@ -628,11 +502,11 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
 async def health_check():
     return {
         "status": "healthy", 
-        "message": "Insurance Policy RAG API with Hugging Face is running",
+        "message": "Insurance Policy RAG API with Gemini is running",
         "initialization_status": initialization_status,
         "environment": {
             "port": os.environ.get("PORT", "8000"),
-            "has_hf_key": bool(os.getenv("HUGGINGFACE_API_KEY")),
+            "has_gemini_key": bool(os.getenv("GEMINI_API_KEY")),
             "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
             "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
         }
@@ -650,8 +524,8 @@ async def get_info():
             "status": "ready",
             "total_vectors": stats.total_vector_count,
             "index_fullness": stats.index_fullness,
-            "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-            "llm_model": "mistralai/Mistral-7B-Instruct-v0.1",
+            "embedding_model": "gemini-enhanced-hash-embeddings",
+            "llm_model": "gemini-pro",
             "initialization_status": initialization_status
         }
     except Exception as e:
@@ -661,11 +535,11 @@ async def get_info():
 @app.get("/")
 async def root():
     return {
-        "message": "Insurance Policy RAG API with Hugging Face",
+        "message": "Insurance Policy RAG API with Gemini",
         "version": "1.0.0",
         "endpoints": {
             "health": "/health",
-            "info": "/info", 
+            "info": "/info",
             "query": "/hackrx/run (POST)"
         }
     }
