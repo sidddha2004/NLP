@@ -1,7 +1,8 @@
-# main.py - Phase 2 Query Service for Railway
+# main.py - Phase 2 Query Service for Railway (Hardcoded Settings)
 import os
 from typing import List
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, status
@@ -9,12 +10,18 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from pinecone import Pinecone
+from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# HARDCODED SETTINGS - No need for environment variables
+PINECONE_ENVIRONMENT = "aws"
+PINECONE_REGION = "us-east-1"
+DEFAULT_PORT = 8000
+DEFAULT_INDEX_NAME = "policy-docs-gemini-hash"  # Your existing index
 
 # Global variables - only what's needed for queries
 gemini_model = None
@@ -44,23 +51,78 @@ def initialize_query_services():
         gemini_model = genai.GenerativeModel('gemini-1.5-pro')
         logger.info("✓ Gemini initialized")
         
-        # Connect to existing Pinecone index (read-only)
+        # Connect to Pinecone (hardcoded settings)
         pinecone_api_key = os.getenv("PINECONE_API_KEY")
         if not pinecone_api_key:
             raise ValueError("PINECONE_API_KEY not found")
             
         pc = Pinecone(api_key=pinecone_api_key)
-        index_name = os.getenv("PINECONE_INDEX", "policy-docs-production")
+        
+        # Try multiple index names with fallback strategy
+        possible_indexes = [
+            DEFAULT_INDEX_NAME,  # Your existing index first
+            "policy-docs-production",
+            "policy-docs",
+            "policy-docs-hf-embeddings",
+            "policy-docs-together-hash"
+        ]
+        
+        # Check which indexes exist
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        logger.info(f"Available indexes: {existing_indexes}")
+        
+        # Find the first available index
+        index_name = None
+        for idx_name in possible_indexes:
+            if idx_name in existing_indexes:
+                index_name = idx_name
+                logger.info(f"✓ Found existing index: {index_name}")
+                break
+        
+        if not index_name:
+            # Create a new index if none exist (hardcoded specs)
+            index_name = DEFAULT_INDEX_NAME
+            logger.info(f"Creating new index: {index_name}")
+            pc.create_index(
+                name=index_name,
+                dimension=512,  # Match your existing index dimension
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud=PINECONE_ENVIRONMENT,
+                    region=PINECONE_REGION
+                )
+            )
+            
+            # Wait for index to be ready
+            logger.info("⏳ Waiting for index to be ready...")
+            max_wait = 60
+            wait_time = 0
+            while wait_time < max_wait:
+                if pc.describe_index(index_name).status['ready']:
+                    break
+                time.sleep(2)
+                wait_time += 2
+                if wait_time % 10 == 0:
+                    logger.info(f"Still waiting... ({wait_time}s)")
+            
+            if wait_time >= max_wait:
+                raise Exception("Index creation timeout")
+        
         index = pc.Index(index_name)
-        logger.info(f"✓ Connected to Pinecone index: {index_name}")
+        logger.info(f"✓ Connected to index: {index_name}")
         
-        # Verify index has data
-        stats = index.describe_index_stats()
-        vector_count = stats.total_vector_count
-        logger.info(f"✓ Index contains {vector_count} vectors")
-        
-        if vector_count == 0:
-            logger.warning("⚠️ Index is empty - documents may not be processed yet")
+        # Check if index has data
+        try:
+            stats = index.describe_index_stats()
+            vector_count = stats.total_vector_count
+            logger.info(f"✓ Index contains {vector_count} vectors")
+            
+            if vector_count == 0:
+                logger.warning("⚠️ Index is empty - run Phase 1 document processing first")
+            else:
+                logger.info(f"✅ Ready to serve queries from {vector_count} document vectors")
+        except Exception as stats_error:
+            logger.warning(f"Could not get index stats: {stats_error}")
         
         initialization_status["ready"] = True
         logger.info("🎯 Phase 2 Query Service ready!")
@@ -225,12 +287,14 @@ async def health_check():
         "message": "Phase 2 Query Service",
         "ready": initialization_status["ready"],
         "error": initialization_status.get("error"),
-        "environment": {
-            "port": os.environ.get("PORT", "8000"),
+        "configuration": {
+            "port": DEFAULT_PORT,
+            "pinecone_environment": PINECONE_ENVIRONMENT,
+            "pinecone_region": PINECONE_REGION,
+            "default_index": DEFAULT_INDEX_NAME,
             "has_gemini_key": bool(os.getenv("GEMINI_API_KEY")),
             "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
-            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN")),
-            "pinecone_index": os.getenv("PINECONE_INDEX", "policy-docs-production")
+            "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
         }
     }
 
@@ -248,11 +312,17 @@ async def detailed_status():
             "vector_database": {
                 "total_vectors": stats.total_vector_count,
                 "index_fullness": stats.index_fullness,
-                "ready": stats.total_vector_count > 0
+                "ready": stats.total_vector_count > 0,
+                "index_name": DEFAULT_INDEX_NAME
             },
             "models": {
                 "llm": "gemini-1.5-pro",
                 "embedding": "models/embedding-001"
+            },
+            "hardcoded_settings": {
+                "pinecone_environment": PINECONE_ENVIRONMENT,
+                "pinecone_region": PINECONE_REGION,
+                "port": DEFAULT_PORT
             }
         }
     except Exception as e:
@@ -271,11 +341,19 @@ async def root():
             "status": "/status", 
             "query": "/hackrx/run (POST)"
         },
-        "phase": "Query Service Only - Documents processed separately"
+        "phase": "Query Service Only - Documents processed separately",
+        "settings": {
+            "pinecone_environment": PINECONE_ENVIRONMENT,
+            "pinecone_region": PINECONE_REGION,
+            "default_port": DEFAULT_PORT,
+            "target_index": DEFAULT_INDEX_NAME
+        }
     }
 
-# For Railway deployment
+# For Railway deployment - use hardcoded port with fallback
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    # Use Railway's PORT if available, otherwise use our default
+    port = int(os.environ.get("PORT", DEFAULT_PORT))
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
