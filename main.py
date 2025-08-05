@@ -1,4 +1,4 @@
-# main.py - Fixed Railway deployment for Insurance Policy RAG API using Gemini 2.0 Flash via OpenRouter
+# main.py - Railway deployment for Insurance Policy RAG API using Gemini 2.0 Flash via OpenRouter and your Pinecone API key
 
 import os
 from typing import List
@@ -9,28 +9,27 @@ import logging
 import requests
 import json
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 import PyPDF2
 import docx
 
 from pinecone import Pinecone, ServerlessSpec
 
-# --- OpenRouter Gemini 2.0 Flash API config ---
+# --- API KEYS: Set them here directly ---
 OPENROUTER_API_KEY = "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"
+PINECONE_API_KEY = "pcsk_2HMPt3_6R2wiF8G1zmHjMaAQmJh69wEFDD16YtJkk3YrTC9wvTD5EiaLVZpLve4Up8nFbt"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "google/gemini-2.0-flash"
 
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # FastAPI setup
 app = FastAPI(title="Insurance Policy RAG API with Gemini 2.0 Flash", version="2.0.0")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,7 +46,7 @@ initialization_status = {
     "error": None
 }
 
-# --- OpenRouter Gemini 2.0 Flash inference ---
+# --- LLM via OpenRouter Gemini 2.0 Flash ---
 def query_openrouter(prompt: str, model=OPENROUTER_MODEL, max_tokens=1024, temperature=0.0) -> str:
     payload = {
         "model": model,
@@ -73,10 +72,7 @@ def init_pinecone():
     try:
         logger.info("🔧 Initializing Pinecone...")
         if pc is None:
-            api_key = os.getenv("PINECONE_API_KEY")
-            if not api_key:
-                raise ValueError("PINECONE_API_KEY environment variable not set")
-            pc = Pinecone(api_key=api_key)
+            pc = Pinecone(api_key=PINECONE_API_KEY)
             logger.info("✓ Pinecone client initialized")
         if index is None:
             index_name = "policy-docs-gemini-hash"
@@ -122,7 +118,7 @@ def init_pinecone():
         initialization_status["error"] = str(e)
         raise e
 
-# Text extraction functions (unchanged)
+# --- Document processing ---
 def extract_text_from_pdf(pdf_path: str) -> str:
     try:
         with open(pdf_path, "rb") as f:
@@ -154,7 +150,6 @@ def extract_text(file_path: str) -> str:
     else:
         raise ValueError(f"Unsupported document format: {ext}")
 
-# Text chunking (unchanged)
 def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
     chunks = []
     start = 0
@@ -165,7 +160,8 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> List[str]:
         start = end - overlap if end - overlap > start else end
     return chunks
 
-# Simple embedding function using text hashing (unchanged)
+# --- Simple embedding (hash-based) ---
+
 def get_simple_embedding(text: str) -> List[float]:
     text = text.lower().strip()
     embeddings = []
@@ -209,7 +205,6 @@ def get_simple_embedding(text: str) -> List[float]:
         embeddings.append(0.0)
     return embeddings
 
-# Use OpenRouter for semantic "embedding" (simulate with keywords then hash)
 def get_gemini_embedding(text: str) -> List[float]:
     try:
         prompt = f"Summarize this insurance text with exactly 50 comma-separated keywords: {text[:1000]}"
@@ -392,7 +387,7 @@ async def health_check():
         "initialization_status": initialization_status,
         "environment": {
             "port": os.environ.get("PORT", "8000"),
-            "has_pinecone_key": bool(os.getenv("PINECONE_API_KEY")),
+            "has_pinecone_key": True,
             "has_bearer_token": bool(os.getenv("API_BEARER_TOKEN"))
         }
     }
@@ -428,8 +423,7 @@ async def root():
         }
     }
 
-# For Railway deployment - run with uvicorn
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
