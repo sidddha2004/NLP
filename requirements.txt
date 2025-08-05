@@ -10,4 +10,4 @@ requests==2.31.0
 numpy==1.24.3
 setuptools
 wheel
-sentence-transformers==2.2.2 # Add this line
+sentence-transformers==2.2.2
