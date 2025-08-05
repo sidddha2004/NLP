@@ -1,280 +1,249 @@
-# phase2_query_service.py - Improved Query Service for Insurance Policy RAG
-# Updated with async client cleanup, graceful startup error handling,
-# consistent env vars, configurable model name, and index existence check.
+# main.py – Insurance Policy RAG API (Gemini 1.5 Flash + TRUE semantic embeddings)
 
-import os
-import hashlib
-import logging
+import os, time, hashlib, traceback, logging, asyncio
 from typing import List
-import traceback
-import asyncio
-import httpx
+from functools import lru_cache
+
+# ────────────────────────────────────────────────  FastAPI  ────────────────────────────────────────────────
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pinecone import Pinecone, ServerlessSpec
-import google.generativeai as genai  # sync SDK, but async Gemini calls via httpx
 
-# Setup logging
+# ────────────────────────────────────────────────  Docs  ───────────────────────────────────────────────────
+import PyPDF2, docx
+
+# ────────────────────────────────────────────────  AI / DB  ───────────────────────────────────────────────
+from pinecone import Pinecone, ServerlessSpec
+import google.generativeai as genai
+
+# ────────────────────────────────────────────────  Logging  ───────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Globals
-gemini_model = None
-pc = None
-index = None
-initialization_status = {"gemini": False, "pinecone": False, "error": None}
+# ────────────────────────────────────────────────  Globals  ───────────────────────────────────────────────
+gemini_model = None          # LLM (1.5-flash) – for answers
+pc = None                    # Pinecone client
+index = None                 # Pinecone index handle
+initialization_status = {
+    "gemini": False,
+    "pinecone": False,
+    "document": False,
+    "document_processing": False,
+    "error": None
+}
 
-OPENAI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = OPENAI_API_KEY.strip() if OPENAI_API_KEY else None
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_API_KEY = PINECONE_API_KEY.strip() if PINECONE_API_KEY else None
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash")
+# ─────────────────────────────────────────────  ENV VARS  ────────────────────────────────────────────────
+API_BEARER_TOKEN   = os.getenv("API_BEARER_TOKEN")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
+EMBED_MODEL        = os.getenv("GEMINI_EMBED_MODEL", "models/embedding-001")   # 768-dim
 
-if not OPENAI_API_KEY:
-    logger.error("GEMINI_API_KEY environment variable is missing!")
-if not PINECONE_API_KEY:
-    logger.error("PINECONE_API_KEY environment variable is missing!")
-if not API_BEARER_TOKEN:
-    logger.error("API_BEARER_TOKEN environment variable is missing!")
+if not GEMINI_API_KEY:   logger.error("⚠️  GEMINI_API_KEY missing")
+if not PINECONE_API_KEY: logger.error("⚠️  PINECONE_API_KEY missing")
+if not API_BEARER_TOKEN: logger.error("⚠️  API_BEARER_TOKEN missing")
 
-async_client = httpx.AsyncClient()
-embedding_cache = {}
+# ────────────────────────────────────────────────  FastAPI app  ───────────────────────────────────────────
+app = FastAPI(title="Insurance Policy RAG API – Gemini 1.5 Flash", version="2.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
-# Async Gemini query via OpenRouter API
-async def query_gemini_async(prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Gemini API key missing")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": MODEL_NAME,  # Configurable
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1024,
-        "temperature": 0.0,
-    }
-    resp = await async_client.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=60,
+# ────────────────────────────────────────────────  Gemini LLM init  ───────────────────────────────────────
+def init_gemini_llm():
+    global gemini_model
+    if gemini_model: return gemini_model
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(
+        'gemini-1.5-flash',
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.1, top_p=0.8, top_k=40,
+            max_output_tokens=1000, response_mime_type="text/plain"
+        )
     )
-    if resp.status_code != 200:
-        logger.error(f"Gemini API failed: {resp.status_code} {resp.text}")
-        raise RuntimeError(f"Gemini API failed: {resp.status_code} {resp.text}")
-    return resp.json()["choices"][0]["message"]["content"]
+    initialization_status["gemini"] = True
+    logger.info("✅ Gemini 1.5 Flash LLM ready")
+    return gemini_model
 
-# Phase 1 compatible simple embedding
-def get_simple_embedding(text: str) -> List[float]:
-    try:
-        text = text.lower().strip()
-        embeddings = []
-        for i in range(16):
-            hash_obj = hashlib.md5(f"{text}_{i}".encode())
-            hash_bytes = hash_obj.digest()
-            for byte_val in hash_bytes:
-                if len(embeddings) < 256:
-                    normalized_val = (byte_val / 255.0) * 2 - 1
-                    embeddings.append(normalized_val)
-        words = text.split()
-        word_features = []
-        word_features.extend([
-            len(text)/1000.0,
-            len(words)/100.0,
-            sum(len(w) for w in words)/max(len(words),1)/10.0,
-            len(set(words))/max(len(words),1),
-            text.count(' ')/max(len(text),1),
-            text.count('.')/max(len(text),1),
-            text.count(',')/max(len(text),1),
-            sum(1 for c in text if c.isupper())/max(len(text),1),
-            sum(1 for c in text if c.isdigit())/max(len(text),1),
-            len([w for w in words if len(w) > 5])/max(len(words),1),
-        ])
-        for i in range(246):
-            if i < len(words):
-                word_hash = hash(f"{words[i]}_{i}") % 10000
-                word_features.append(word_hash / 10000.0)
-            elif i < len(text):
-                char_hash = hash(f"{text[i]}_{i}") % 10000
-                word_features.append(char_hash / 10000.0)
-            else:
-                word_features.append(0.0)
-        word_features = word_features[:256]
-        while len(word_features) < 256:
-            word_features.append(0.0)
-        embeddings.extend(word_features)
-        embeddings = embeddings[:512]
-        while len(embeddings) < 512:
-            embeddings.append(0.0)
-        return embeddings
-    except Exception as e:
-        logger.error(f"Error creating embedding: {e}")
-        return [0.0] * 512
-
-async def get_gemini_embedding(text: str) -> List[float]:
-    if text in embedding_cache:
-        return embedding_cache[text]
-    try:
-        prompt = f"Extract 50 focused and relevant keywords from the following insurance text, separated by commas:\n{text[:1000]}"
-        keywords = await query_gemini_async(prompt)
-        embedding = get_simple_embedding(keywords)
-        if len(embedding) != 512:
-            embedding.extend([0.0] * (512 - len(embedding)))
-            embedding = embedding[:512]
-        embedding_cache[text] = embedding
-        return embedding
-    except Exception as e:
-        logger.error(f"Error getting Gemini embedding: {e}")
-        return get_simple_embedding(text)
-
-async def query_chunks(query: str, index, top_k: int = 5) -> List[str]:
-    try:
-        embedding = await get_gemini_embedding(query)
-        response = index.query(vector=embedding, top_k=top_k, include_metadata=True)
-        chunks = [hit.metadata.get("text", "") for hit in response.matches]
-        logger.info(f"Found {len(chunks)} chunks for query")
-        return chunks
-    except Exception as e:
-        logger.error(f"Error querying chunks: {e}")
-        return []
-
-async def generate_answer(question: str, context_clauses: List[str]) -> str:
-    if not context_clauses:
-        return "No relevant information found in the document."
-    prompt = f"""
-You are a professional assistant specialized in insurance policy analysis.
-Answer the question strictly based on the provided clauses below.
-Do NOT speculate or include information outside these clauses.
-Quote or reference the clauses in your response where possible.
-
-Clauses:
-{chr(10).join(['- ' + c for c in context_clauses])}
-
-Question:
-{question}
-
-Answer clearly, concisely, and cite relevant clauses:
-"""
-    try:
-        answer = await query_gemini_async(prompt)
-        return answer
-    except Exception as e:
-        logger.error(f"Error generating answer: {e}")
-        return f"Error generating answer: {str(e)}"
-
-# Security using Bearer token
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    expected_token = API_BEARER_TOKEN
-    if not expected_token:
-        logger.error("API_BEARER_TOKEN not configured")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail="API_BEARER_TOKEN not configured")
-    if token != expected_token:
-        logger.warning("Invalid token received")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Invalid authentication token")
+# ─────────────────────────────────────────  EMBEDDING HELPERS  ────────────────────────────────────────────
+@lru_cache(maxsize=2)
+def _check_embed_ready():
+    """Ping once so later calls don’t re-configure."""
+    genai.configure(api_key=GEMINI_API_KEY)
     return True
 
-# Pydantic request/response models
+async def get_embedding_gemini(text: str, task_type="RETRIEVAL_DOCUMENT") -> List[float]:
+    """
+    Async wrapper around Google Embedding API (768-dim).
+    task_type: 'RETRIEVAL_DOCUMENT'  or  'RETRIEVAL_QUERY'
+    """
+    _check_embed_ready()
+    loop = asyncio.get_event_loop()
+    try:
+        resp = await loop.run_in_executor(
+            None,
+            lambda: genai.embed_content(
+                model = EMBED_MODEL,
+                content = text,
+                task_type = task_type
+            )
+        )
+        vec = resp["embedding"]
+        if not vec or len(vec) != 768:
+            raise ValueError("Bad embedding length")
+        return vec
+    except Exception as e:
+        logger.error(f"Embedding error: {e}")
+        return [0.0]*768
+
+async def embed_batch(texts: List[str], task_type="RETRIEVAL_DOCUMENT") -> List[List[float]]:
+    """Embed a list of strings concurrently (fan-out)."""
+    coros = [get_embedding_gemini(t, task_type) for t in texts]
+    return await asyncio.gather(*coros)
+
+# ────────────────────────────────────────────────  Pinecone init  ─────────────────────────────────────────
+def init_pinecone():
+    global pc, index
+    if pc is None:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        logger.info("✅ Pinecone client connected")
+    if index is None:
+        index_name = "policy-docs-gemini-1-5-flash"
+        names = [i.name for i in pc.list_indexes()]
+        if index_name not in names:
+            logger.info(f"Creating index '{index_name}' (768-dim)")
+            pc.create_index(index_name, dimension=768, metric="cosine",
+                            spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+            time.sleep(8)
+        index = pc.Index(index_name)
+        initialization_status["pinecone"] = True
+        logger.info("✅ Pinecone index ready")
+    return pc, index
+
+# ────────────────────────────────────────────────  Extraction / Chunking  ────────────────────────────────
+def extract_text(file_path:str)->str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext==".pdf":
+        with open(file_path,"rb")as f:
+            r,txt=PyPDF2.PdfReader(f),""
+            for p in r.pages:
+                if (t:=p.extract_text()): txt+=t+"\n"
+            return txt
+    if ext==".docx":
+        doc = docx.Document(file_path)
+        return "\n".join(p.text for p in doc.paragraphs)
+    raise ValueError("Unsupported doc format")
+
+def chunk_text(text:str, size=800, overlap=100)->List[str]:
+    out=[]; i=0; L=len(text)
+    while i<L:
+        end=min(i+size,L); out.append(text[i:end])
+        i = end-overlap if end-overlap>i else end
+    return out
+
+# ─────────────────────────────────────────────  DOCUMENT INGESTION  ──────────────────────────────────────
+async def upsert_chunks_async(chunks: List[str]):
+    batch = 10
+    for i in range(0,len(chunks),batch):
+        batch_text = chunks[i:i+batch]
+        vectors  = await embed_batch(batch_text, task_type="RETRIEVAL_DOCUMENT")
+        payloads = [{
+            "id"   : f"doc-{i+j}-{int(time.time())}",
+            "values": vec,
+            "metadata": {"text": batch_text[j]}
+        } for j,vec in enumerate(vectors)]
+        index.upsert(vectors=payloads)
+        logger.info(f"Upserted batch {i//batch+1}")
+
+async def process_documents_background():
+    try:
+        initialization_status["document_processing"]=True
+        file="policy.pdf"
+        if not os.path.exists(file):
+            logger.error("policy.pdf not found – skipping ingestion")
+            return
+        txt = extract_text(file)
+        chunks = chunk_text(txt)
+        logger.info(f"📄 {len(chunks)} chunks generated")
+        # optional: clear previous
+        try: index.delete(delete_all=True); time.sleep(3)
+        except Exception: pass
+        await upsert_chunks_async(chunks)
+        initialization_status["document"]=True
+    except Exception as e:
+        logger.error(f"Ingestion error: {e}")
+        initialization_status["error"]=str(e)
+    finally:
+        initialization_status["document_processing"]=False
+
+# ────────────────────────────────────────────────  Retrieval  ────────────────────────────────────────────
+def query_chunks(query:str, top_k:int=3)->List[str]:
+    try:
+        vec = asyncio.run(get_embedding_gemini(query,"RETRIEVAL_QUERY"))
+        res = index.query(vector=vec, top_k=top_k, include_metadata=True)
+        return [m.metadata["text"] for m in res.matches]
+    except Exception as e:
+        logger.error(f"Query err: {e}")
+        return []
+
+def answer_with_llm(question:str, clauses:List[str])->str:
+    ctx="\n\n".join(f"CLAUSE {i+1}:\n{c}" for i,c in enumerate(clauses))
+    prompt=f"""You are an insurance-policy assistant.
+Use only the clauses to answer in ≤3 sentences, quote if helpful.
+
+QUESTION: {question}
+CLAUSES:
+{ctx}
+
+ANSWER:"""
+    try:
+        return gemini_model.generate_content(prompt).text.strip()
+    except Exception as e:
+        logger.error(e); return "Unable to answer."
+
+# ───────────────────────────────────────────────  Security  ─────────────────────────────────────────────
+security = HTTPBearer()
+def verify(credentials:HTTPAuthorizationCredentials=Depends(security)):
+    if credentials.credentials!=API_BEARER_TOKEN:
+        raise HTTPException(status_code=403, detail="Bad token")
+
+# ─────────────────────────────────────────────  Pydantic models  ─────────────────────────────────────────
 class QueryRequest(BaseModel):
     questions: List[str]
-
 class QueryResponse(BaseModel):
-    answers: List[str]
+    answers  : List[str]
 
-# FastAPI app setup
-app = FastAPI(title="Insurance Policy Query Service", version="1.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-def initialize_gemini():
-    global gemini_model
-    try:
-        if gemini_model is None:
-            if not OPENAI_API_KEY:
-                raise ValueError("GEMINI_API_KEY env var not set")
-            genai.configure(api_key=OPENAI_API_KEY)
-            gemini_model = genai.GenerativeModel(MODEL_NAME)
-            logger.info("Gemini model initialized")
-        return gemini_model
-    except Exception as e:
-        logger.error(f"Failed to initialize Gemini: {e}")
-        raise
-
-def initialize_pinecone():
-    global pc, index
-    try:
-        if pc is None:
-            if not PINECONE_API_KEY:
-                raise ValueError("PINECONE_API_KEY env var not set")
-            pc = Pinecone(api_key=PINECONE_API_KEY)
-            logger.info("Pinecone client initialized")
-        if index is None:
-            index_name = "policy-docs-gemini-hash"
-            existing_indexes = [idx.name for idx in pc.list_indexes()]
-            logger.info(f"Available indexes: {existing_indexes}")
-            if index_name not in existing_indexes:
-                raise ValueError(f"Pinecone index '{index_name}' not found. Populate Phase 1 first.")
-            index = pc.Index(index_name)
-            stats = index.describe_index_stats()
-            if stats.total_vector_count == 0:
-                logger.warning("Pinecone index is empty")
-            else:
-                logger.info(f"Pinecone index ready with {stats.total_vector_count} vectors")
-        return pc, index
-    except Exception as e:
-        logger.error(f"Failed to initialize Pinecone: {e}")
-        raise
-
+# ───────────────────────────────────────────────  Startup  ──────────────────────────────────────────────
 @app.on_event("startup")
-async def startup_event():
-    global gemini_model, pc, index
-    logger.info("=== Starting up Query Service ===")
+async def _startup():
     try:
-        gemini_model = initialize_gemini()
-        pc, index = initialize_pinecone()
-        initialization_status["gemini"] = True
-        initialization_status["pinecone"] = True
+        init_gemini_llm()
+        init_pinecone()
+        asyncio.create_task(process_documents_background())
     except Exception as e:
-        logger.error(f"Error during startup: {e}")
-        initialization_status["error"] = str(e)
+        initialization_status["error"]=str(e)
 
 @app.on_event("shutdown")
-async def shutdown_event():
-    await async_client.aclose()
+async def _shutdown():
+    pass  # nothing async to close now
 
-@app.post("/query", response_model=QueryResponse)
-async def query_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)):
-    if not (index and gemini_model):
-        raise HTTPException(status_code=503, detail="Service is initializing or unavailable")
-    answers = []
-    for question in req.questions:
-        context_clauses = await query_chunks(question, index)
-        answer = await generate_answer(question, context_clauses)
-        answers.append(answer)
+# ───────────────────────────────────────────  End-user endpoints  ───────────────────────────────────────
+@app.post("/hackrx/run", response_model=QueryResponse)
+async def run(req:QueryRequest, _:bool=Depends(verify)):
+    answers=[]
+    for q in req.questions:
+        clauses = query_chunks(q)
+        answers.append(answer_with_llm(q,clauses) if clauses else "No data yet.")
     return QueryResponse(answers=answers)
 
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "gemini_ready": initialization_status.get("gemini", False),
-        "pinecone_ready": initialization_status.get("pinecone", False),
-        "error": initialization_status.get("error")
-    }
+async def health():
+    return {"status":"ok","init":initialization_status}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+@app.get("/")
+async def root():
+    return {"message":"Insurance Policy RAG – Gemini 1.5 Flash + embeddings-001"}
+
+# ─────────────────────────────────────────────  Railway entrypoint  ─────────────────────────────────────
+if __name__=="__main__":
+    import uvicorn, sys
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT",8000)))
