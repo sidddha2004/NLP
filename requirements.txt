@@ -3,4 +3,6 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 google-generativeai==0.3.2
 pinecone==3.0.0
-pydantic==2.
+pydantic==2.5.0
+python-multipart==0.0.6
+requests==2.31.0
