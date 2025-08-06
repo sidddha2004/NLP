@@ -321,7 +321,8 @@ Answer:
             
             # Add debugging info in logs
             logger.info(f"Generated answer length: {len(answer)} chars")
-            logger.info(f"Used {len(best_chunks)} context chunks with scores: {[f'{c[\"score\"]:.3f}' for c in best_chunks]}")
+            scores_list = [f"{c['score']:.3f}" for c in best_chunks]
+            logger.info(f"Used {len(best_chunks)} context chunks with scores: {scores_list}")
             
             return answer
             
