@@ -106,108 +106,191 @@ class QueryService:
             raise e
     
     def create_query_embedding(self, query: str) -> List[float]:
-        """Create embedding for query using same method as Phase 1"""
+        """Create embedding for query using EXACT same method as Phase 1"""
         try:
-            # Use Gemini to enhance query understanding
+            # Use Gemini to enhance query understanding (same prompt style as Phase 1)
             prompt = f"""
-            Analyze this insurance policy question and extract the key concepts and terms that should be searched for.
-            Focus on: policy terms, coverage types, conditions, exclusions, procedures, and related legal concepts.
+            Extract key insurance concepts and terms from this question. Focus on:
+            - Coverage types and limits
+            - Policy conditions and terms  
+            - Exclusions and restrictions
+            - Claims procedures
+            - Premium and payment details
+            - Legal and regulatory terms
             
             Question: {query}
             
-            Provide exactly 50 key search terms and concepts related to this question, separated by commas:
+            List 30 most important keywords/concepts (comma-separated):
             """
             
             response = self.gemini_model.generate_content(prompt)
-            search_terms = response.text.strip()
+            keywords = response.text.strip()
             
-            # Convert to embedding using same method as Phase 1
-            embedding = self._text_to_embedding(search_terms + " " + query)
-            
-            if len(embedding) != 768:
-                if len(embedding) < 768:
-                    embedding.extend([0.0] * (768 - len(embedding)))
-                else:
-                    embedding = embedding[:768]
+            # Combine keywords with original query (same as Phase 1)
+            enhanced_text = f"{keywords} {query}"
+            embedding = self._create_hybrid_embedding(enhanced_text, query)
             
             return embedding
             
         except Exception as e:
             logger.error(f"Error creating query embedding: {e}")
-            # Fallback to simple embedding
-            return self._text_to_embedding(query)
+            # Fallback to hybrid embedding
+            return self._create_hybrid_embedding(query, query)
     
-    def _text_to_embedding(self, text: str) -> List[float]:
-        """Convert text to 768-dimensional embedding (same as Phase 1)"""
-        import hashlib
+    def _create_hybrid_embedding(self, enhanced_text: str, original_text: str) -> List[float]:
+        """Create hybrid embedding - MUST match Phase 1 exactly"""
+        # Method 1: Hash-based semantic features (384 dims)
+        semantic_features = self._get_semantic_hash_features(enhanced_text, 384)
         
-        embeddings = []
-        text = text.lower().strip()
+        # Method 2: Statistical text features (384 dims) 
+        statistical_features = self._get_statistical_features(original_text, 384)
         
-        # Multiple hash functions for different aspects (matching Phase 1)
-        hash_functions = [
-            lambda t, i: hashlib.md5(f"{t}_{i}".encode()).digest(),
-            lambda t, i: hashlib.sha1(f"{t}_{i}".encode()).digest(),
-            lambda t, i: hashlib.sha256(f"{t}_{i}".encode()).digest(),
-        ]
-        
-        # Generate embeddings from different hash functions
-        for hash_func in hash_functions:
-            for i in range(256):
-                if len(embeddings) >= 768:
-                    break
-                hash_bytes = hash_func(text, i)
-                for byte_val in hash_bytes:
-                    if len(embeddings) >= 768:
-                        break
-                    normalized_val = (byte_val / 255.0) * 2 - 1
-                    embeddings.append(normalized_val)
+        # Combine both approaches
+        embedding = semantic_features + statistical_features
         
         # Ensure exactly 768 dimensions
-        embeddings = embeddings[:768]
-        while len(embeddings) < 768:
-            embeddings.append(0.0)
+        embedding = embedding[:768]
+        while len(embedding) < 768:
+            embedding.append(0.0)
         
-        return embeddings
+        return embedding
     
-    def search_relevant_chunks(self, query: str, top_k: int = 5) -> List[str]:
-        """Search for relevant chunks in Pinecone"""
+    def _get_semantic_hash_features(self, text: str, target_dims: int) -> List[float]:
+        """Generate semantic hash features - IDENTICAL to Phase 1"""
+        import hashlib
+        features = []
+        text = text.lower().strip()
+        
+        # Create semantic variations (same as Phase 1)
+        variations = [
+            text,
+            ' '.join(sorted(text.split())),  # Sorted words
+            ''.join(c for c in text if c.isalnum() or c.isspace()),  # Alphanumeric only
+        ]
+        
+        for variation in variations:
+            for i in range(target_dims // len(variations)):
+                if len(features) >= target_dims:
+                    break
+                hash_val = hashlib.sha256(f"{variation}_{i}".encode()).digest()
+                for byte_val in hash_val:
+                    if len(features) >= target_dims:
+                        break
+                    features.append((byte_val / 255.0) * 2 - 1)
+        
+        return features[:target_dims]
+    
+    def _get_statistical_features(self, text: str, target_dims: int) -> List[float]:
+        """Generate statistical text features - IDENTICAL to Phase 1"""
+        features = []
+        words = text.lower().split()
+        
+        # Basic statistics (same as Phase 1)
+        basic_stats = [
+            len(text) / 10000.0,  # Text length (normalized)
+            len(words) / 1000.0,  # Word count (normalized)  
+            len(set(words)) / max(len(words), 1),  # Unique word ratio
+            sum(len(w) for w in words) / max(len(words), 1) / 15.0,  # Avg word length
+            text.count('.') / max(len(text), 1) * 100,  # Sentence density
+            text.count(',') / max(len(text), 1) * 100,  # Comma density
+            sum(1 for c in text if c.isupper()) / max(len(text), 1),  # Uppercase ratio
+            sum(1 for c in text if c.isdigit()) / max(len(text), 1),  # Digit ratio
+        ]
+        
+        features.extend(basic_stats)
+        
+        # Word-based features (same terms as Phase 1)
+        common_insurance_terms = [
+            'policy', 'coverage', 'premium', 'deductible', 'claim', 'benefit', 
+            'exclusion', 'condition', 'insured', 'insurer', 'liability', 'limit'
+        ]
+        
+        for term in common_insurance_terms:
+            count = text.lower().count(term)
+            features.append(min(count / max(len(words), 1) * 100, 1.0))
+        
+        # Character n-gram features (same as Phase 1)
+        for n in [2, 3, 4]:
+            ngrams = [text[i:i+n] for i in range(len(text)-n+1)]
+            for i in range(min(50, len(ngrams))):
+                if len(features) >= target_dims:
+                    break
+                hash_val = hash(ngrams[i]) % 10000
+                features.append(hash_val / 10000.0)
+        
+        # Pad to target dimensions
+        while len(features) < target_dims:
+            features.append(0.0)
+        
+        return features[:target_dims]
+    
+    def search_relevant_chunks(self, query: str, top_k: int = 8) -> List[dict]:
+        """Search for relevant chunks with improved scoring"""
         try:
             query_embedding = self.create_query_embedding(query)
             
             if not query_embedding:
                 return []
             
+            # Search with higher top_k for better results
             query_response = self.index.query(
                 vector=query_embedding,
-                top_k=top_k,
+                top_k=top_k * 2,  # Get more candidates
                 include_metadata=True
             )
             
-            relevant_texts = []
-            for match in query_response.matches:
-                if match.score > 0.3:  # Similarity threshold
-                    text = match.metadata.get("text", "")
-                    if text:
-                        relevant_texts.append(text)
+            relevant_chunks = []
+            seen_texts = set()  # Avoid duplicates
             
-            logger.info(f"Found {len(relevant_texts)} relevant chunks for query")
-            return relevant_texts
+            for match in query_response.matches:
+                # Lower similarity threshold for better recall
+                if match.score > 0.1:  # Reduced from 0.3
+                    text = match.metadata.get("text", "")
+                    if text and text not in seen_texts:
+                        relevant_chunks.append({
+                            'text': text,
+                            'score': match.score,
+                            'length': match.metadata.get('length', len(text))
+                        })
+                        seen_texts.add(text)
+                        
+                        if len(relevant_chunks) >= top_k:
+                            break
+            
+            # Sort by score descending
+            relevant_chunks.sort(key=lambda x: x['score'], reverse=True)
+            
+            logger.info(f"Found {len(relevant_chunks)} relevant chunks for query")
+            if relevant_chunks:
+                logger.info(f"Best match score: {relevant_chunks[0]['score']:.3f}")
+            
+            return relevant_chunks
             
         except Exception as e:
             logger.error(f"Error searching for relevant chunks: {e}")
             return []
     
-    def generate_answer(self, question: str, context_chunks: List[str]) -> str:
-        """Generate answer using Gemini with retrieved context"""
+    def generate_answer(self, question: str, context_chunks: List[dict]) -> str:
+        """Generate answer using Gemini with improved context handling"""
         try:
             if not context_chunks:
                 return "I couldn't find relevant information in the policy document to answer your question. Please try rephrasing your question or contact support for assistance."
             
-            context = "\n\n".join([f"Context {i+1}:\n{chunk}" for i, chunk in enumerate(context_chunks)])
+            # Sort chunks by relevance score and take best ones
+            sorted_chunks = sorted(context_chunks, key=lambda x: x['score'], reverse=True)
+            best_chunks = sorted_chunks[:5]  # Use top 5 chunks
             
+            # Create rich context with relevance scores
+            context_parts = []
+            for i, chunk in enumerate(best_chunks):
+                relevance = "High" if chunk['score'] > 0.7 else "Medium" if chunk['score'] > 0.4 else "Low"
+                context_parts.append(f"Context {i+1} (Relevance: {relevance}):\n{chunk['text']}")
+            
+            context = "\n\n" + "="*50 + "\n\n".join(context_parts)
+            
+            # Enhanced prompt for better answers
             prompt = f"""
-You are an expert insurance policy assistant. Answer the question based ONLY on the provided policy context.
+You are an expert insurance policy analyst. Answer the question based STRICTLY on the provided policy context.
 
 Question: {question}
 
@@ -215,18 +298,32 @@ Policy Context:
 {context}
 
 Instructions:
-1. Answer based strictly on the provided context
-2. If the context doesn't contain enough information, say so clearly
-3. Quote specific policy clauses when relevant
-4. Be precise and avoid speculation
-5. If there are exclusions or conditions, mention them clearly
-6. Use clear, professional language
+1. Answer based ONLY on the provided policy context - do not add external knowledge
+2. If the context contains relevant information, provide a detailed answer
+3. Quote specific policy sections, clauses, or terms when available
+4. If exclusions, conditions, or limitations apply, mention them clearly
+5. If the context is insufficient, say so honestly
+6. Use professional, clear language appropriate for insurance matters
+7. Structure your answer logically with key points
+
+Guidelines:
+- Start with a direct answer if possible
+- Provide supporting details from the policy
+- Mention any important conditions or exclusions
+- Be specific about coverage amounts, time limits, procedures if mentioned
+- If multiple contexts provide information, synthesize them coherently
 
 Answer:
 """
             
             response = self.gemini_model.generate_content(prompt)
-            return response.text.strip()
+            answer = response.text.strip()
+            
+            # Add debugging info in logs
+            logger.info(f"Generated answer length: {len(answer)} chars")
+            logger.info(f"Used {len(best_chunks)} context chunks with scores: {[f'{c[\"score\"]:.3f}' for c in best_chunks]}")
+            
+            return answer
             
         except Exception as e:
             logger.error(f"Error generating answer: {e}")
@@ -300,9 +397,9 @@ async def run_endpoint(req: QueryRequest, verified: bool = Depends(verify_token)
             logger.info(f"Processing question: {question[:100]}...")
             
             # Search for relevant chunks
-            relevant_chunks = query_service.search_relevant_chunks(question, top_k=5)
+            relevant_chunks = query_service.search_relevant_chunks(question, top_k=8)
             
-            # Generate answer
+            # Generate answer  
             answer = query_service.generate_answer(question, relevant_chunks)
             answers.append(answer)
             
