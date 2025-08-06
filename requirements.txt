@@ -1,19 +1,6 @@
-# Core FastAPI (pinned minimal versions)
+# Phase 2 Requirements - Minimal dependencies for Railway deployment
 fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-
-# Security
-python-jose[cryptography]==3.3.0
-
-# Document processing (minimal)
-PyPDF2==3.0.1
-
-# Vector database
-pinecone-client==2.2.4
-
-# AI
+uvicorn[standard]==0.24.0
 google-generativeai==0.3.2
-
-# Lightweight but high-quality embeddings
-sentence-transformers==2.2.2
+pinecone==3.0.0
+pydantic==2.
