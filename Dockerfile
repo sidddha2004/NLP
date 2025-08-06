@@ -1,45 +1,53 @@
-# Use the smallest Python base image
-FROM python:3.11-alpine as builder
+# Railway-Optimized Dockerfile for Phase 2
+# Specifically optimized for Railway's deployment environment
 
-# Set environment variables
+FROM python:3.11-slim as builder
+
+# Set environment variables for build
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install build dependencies (minimal)
-RUN apk add --no-cache \
-    build-base \
-    libffi-dev \
-    openssl-dev
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Copy requirements and install dependencies
+COPY requirements.txt /tmp/
+RUN pip install --user --no-warn-script-location -r /tmp/requirements.txt
 
-# Production stage - ultra minimal
-FROM python:3.11-alpine
+# Production stage
+FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/root/.local/bin:$PATH"
+    PATH="/home/appuser/.local/bin:$PATH"
 
-# Install only essential runtime dependencies
-RUN apk add --no-cache libffi openssl
+# Create app user
+RUN useradd --create-home --shell /bin/bash appuser
 
-# Copy only installed packages
-COPY --from=builder /root/.local /root/.local
+# Copy installed packages from builder
+COPY --from=builder /root/.local /home/appuser/.local
 
-# Create app directory
-WORKDIR /app
+# Set working directory
+WORKDIR /home/appuser/app
 
-# Copy only essential files
-COPY main.py .
-COPY policy.pdf .
+# Copy application files
+COPY --chown=appuser:appuser main.py ./
 
-# Expose port
-EXPOSE 8000
+# Switch to app user
+USER appuser
 
-# Use exec form and single worker for memory efficiency
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--access-log", "--no-use-colors"]
+# Expose port (Railway will set PORT env var)
+EXPOSE $PORT
+
+# Health check optimized for Railway
+HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=2 \
+    CMD python -c "import requests; requests.get(f'http://localhost:{__import__(\"os\").environ.get(\"PORT\", 8000)}/health', timeout=5)" || exit 1
+
+# Use Railway's PORT environment variable
+CMD python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
