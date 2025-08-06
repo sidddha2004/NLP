@@ -271,7 +271,7 @@ class QueryService:
             return []
     
     def generate_answer(self, question: str, context_chunks: List[dict]) -> str:
-        """Generate answer using Gemini with improved context handling"""
+        """Generate precise, policy-specific answers using enhanced prompting"""
         try:
             if not context_chunks:
                 return "I couldn't find relevant information in the policy document to answer your question. Please try rephrasing your question or contact support for assistance."
@@ -280,44 +280,73 @@ class QueryService:
             sorted_chunks = sorted(context_chunks, key=lambda x: x['score'], reverse=True)
             best_chunks = sorted_chunks[:5]  # Use top 5 chunks
             
-            # Create rich context with relevance scores
+            # Create focused context
             context_parts = []
             for i, chunk in enumerate(best_chunks):
-                relevance = "High" if chunk['score'] > 0.7 else "Medium" if chunk['score'] > 0.4 else "Low"
-                context_parts.append(f"Context {i+1} (Relevance: {relevance}):\n{chunk['text']}")
+                context_parts.append(f"Policy Section {i+1}:\n{chunk['text']}")
             
             context = "\n\n" + "="*50 + "\n\n".join(context_parts)
             
-            # Enhanced prompt for better answers
+            # Enhanced prompt for precise, policy-specific answers
             prompt = f"""
-You are an expert insurance policy analyst. Answer the question based STRICTLY on the provided policy context.
+You are an expert insurance policy analyst specializing in providing precise, actionable answers from policy documents.
 
 Question: {question}
 
 Policy Context:
 {context}
 
-Instructions:
-1. Answer based ONLY on the provided policy context - do not add external knowledge
-2. If the context contains relevant information, provide a detailed answer
-3. Quote specific policy sections, clauses, or terms when available
-4. If exclusions, conditions, or limitations apply, mention them clearly
-5. If the context is insufficient, say so honestly
-6. Use professional, clear language appropriate for insurance matters
-7. Structure your answer logically with key points
+INSTRUCTIONS FOR RESPONSE FORMAT:
+1. Start with a direct, specific answer to the question
+2. Quote exact policy terms, periods, amounts, and conditions
+3. Use precise language from the policy document
+4. Include specific numbers, timeframes, and limits when mentioned
+5. Be concise but comprehensive
+6. If there are conditions or exceptions, state them clearly
 
-Guidelines:
-- Start with a direct answer if possible
-- Provide supporting details from the policy
-- Mention any important conditions or exclusions
-- Be specific about coverage amounts, time limits, procedures if mentioned
-- If multiple contexts provide information, synthesize them coherently
+RESPONSE STYLE:
+- Use declarative statements (e.g., "A grace period of thirty days is provided...")
+- Include specific details (amounts, timeframes, percentages)
+- Quote policy language when relevant
+- Mention eligibility criteria if applicable
+- State limitations or exclusions clearly
 
-Answer:
+EXAMPLES OF GOOD RESPONSES:
+- "A grace period of thirty days is provided for premium payment after the due date..."
+- "There is a waiting period of thirty-six (36) months of continuous coverage..."
+- "The policy covers maternity expenses with a benefit limit of [amount] per delivery..."
+- "Pre-existing diseases are covered after a waiting period of [X] months..."
+
+If the context doesn't contain sufficient information to answer the question specifically, say: "The policy document provided does not contain specific information about [topic]. Please refer to the complete policy document or contact your insurance provider."
+
+Generate a precise, policy-focused answer:
 """
             
             response = self.gemini_model.generate_content(prompt)
             answer = response.text.strip()
+            
+            # Post-process to ensure quality
+            if len(answer) < 50 and "sufficient information" not in answer.lower():
+                # If answer is too short and not an "insufficient info" response, try to enhance it
+                enhanced_prompt = f"""
+Based on this policy context, provide a more detailed answer to: {question}
+
+Context: {context[:1000]}
+
+Provide specific details including:
+- Exact time periods mentioned
+- Specific amounts or limits
+- Eligibility requirements
+- Any conditions or restrictions
+
+Answer:
+"""
+                try:
+                    enhanced_response = self.gemini_model.generate_content(enhanced_prompt)
+                    if len(enhanced_response.text.strip()) > len(answer):
+                        answer = enhanced_response.text.strip()
+                except:
+                    pass  # Keep original answer if enhancement fails
             
             # Add debugging info in logs
             logger.info(f"Generated answer length: {len(answer)} chars")
