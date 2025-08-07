@@ -34,8 +34,8 @@ app = FastAPI(
     title="Railway Semantic Search API", 
     version="2.3.0",
     debug=False,
-    docs_url="/api/v1/docs",
-    redoc_url="/api/v1/redoc"
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # CORS middleware
@@ -423,53 +423,14 @@ async def startup_event():
         logger.error(f"=== STARTUP FAILED: {e} ===")
         raise
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Railway Semantic Search API - Ultra Enhanced Version",
-        "version": "2.3.0",
-        "status": "active",
-        "api_version": "v1",
-        "endpoints": {
-            "main": "/api/v1/hackrx/run",
-            "fallback": "/hackrx/run",
-            "health": "/api/v1/health", 
-            "debug": "/api/v1/debug"
-        },
-        "enhancements": [
-            "Multi-stage search pipeline",
-            "Advanced caching system",
-            "Enhanced scoring algorithms",
-            "Ultra-smart context selection",
-            "Optimized answer generation",
-            "Improved concurrency"
-        ]
-    }
-
-@app.get("/api/v1/health")
-async def health_check_v1():
-    """Health check endpoint with API versioning"""
-    return {"status": "healthy", "version": "2.3.0", "timestamp": time.time()}
-
 @app.get("/health")
 async def health_check():
-    """Health check endpoint - fallback"""
+    """Health check endpoint"""
     return {"status": "healthy", "version": "2.3.0", "timestamp": time.time()}
-
-@app.get("/api/v1/cache-stats")
-async def cache_stats_v1(token: str = Depends(verify_token)):
-    """Cache statistics endpoint with API versioning"""
-    return {
-        "search_cache_size": len(search_cache),
-        "auth_cache_size": len(auth_cache),
-        "max_cache_size": MAX_CACHE_SIZE,
-        "cache_ttl": CACHE_TTL
-    }
 
 @app.get("/cache-stats")
 async def cache_stats(token: str = Depends(verify_token)):
-    """Cache statistics endpoint - fallback"""
+    """Cache statistics endpoint"""
     return {
         "search_cache_size": len(search_cache),
         "auth_cache_size": len(auth_cache),
@@ -477,28 +438,20 @@ async def cache_stats(token: str = Depends(verify_token)):
         "cache_ttl": CACHE_TTL
     }
 
-@app.post("/api/v1/clear-cache")
-async def clear_cache_v1(token: str = Depends(verify_token)):
-    """Clear cache endpoint with API versioning"""
-    global search_cache, auth_cache
-    search_cache.clear()
-    auth_cache.clear()
-    return {"message": "Cache cleared successfully"}
-
 @app.post("/clear-cache")
 async def clear_cache(token: str = Depends(verify_token)):
-    """Clear cache endpoint - fallback"""
+    """Clear cache endpoint"""
     global search_cache, auth_cache
     search_cache.clear()
     auth_cache.clear()
     return {"message": "Cache cleared successfully"}
 
-@app.post("/api/v1/debug-search")
-async def debug_search_endpoint_v1(
+@app.post("/debug-search")
+async def debug_search_endpoint(
     request: SearchDebugRequest,
     token: str = Depends(verify_token)
 ):
-    """Enhanced debug endpoint with API versioning"""
+    """Enhanced debug endpoint"""
     try:
         start_time = time.time()
         
@@ -548,20 +501,12 @@ async def debug_search_endpoint_v1(
         logger.error(f"Error in enhanced debug search: {e}")
         return {"error": str(e)}
 
-@app.post("/debug-search")
-async def debug_search_endpoint(
-    request: SearchDebugRequest,
-    token: str = Depends(verify_token)
-):
-    """Enhanced debug endpoint - fallback"""
-    return await debug_search_endpoint_v1(request, token)
-
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """ULTRA-ENHANCED main endpoint for processing queries with API versioning"""
+    """ULTRA-ENHANCED main endpoint for processing queries"""
     try:
         start_time = time.time()
         
@@ -638,17 +583,34 @@ async def process_query(
         logger.error(f"Error in ultra-enhanced processing: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def process_query_fallback(
+@app.post("/api/hackrx/run", response_model=QueryResponse)
+async def process_query_api(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """Main endpoint fallback - redirects to versioned endpoint"""
+    """Alternative endpoint path"""
     return await process_query(request, token)
 
-@app.get("/api/v1/debug")
-async def debug_info_v1():
-    """Enhanced debug endpoint with API versioning"""
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Railway Semantic Search API - Ultra Enhanced Version",
+        "version": "2.3.0",
+        "status": "active",
+        "enhancements": [
+            "Multi-stage search pipeline",
+            "Advanced caching system",
+            "Enhanced scoring algorithms",
+            "Ultra-smart context selection",
+            "Optimized answer generation",
+            "Improved concurrency"
+        ]
+    }
+
+@app.get("/debug")
+async def debug_info():
+    """Enhanced debug endpoint"""
     try:
         index_stats = pc_index.describe_index_stats()
         
@@ -658,7 +620,6 @@ async def debug_info_v1():
         return {
             "app_status": "ultra-enhanced",
             "version": "2.3.0",
-            "api_version": "v1",
             "performance": {
                 "search_cache_size": len(search_cache),
                 "auth_cache_size": len(auth_cache),
@@ -683,11 +644,6 @@ async def debug_info_v1():
     except Exception as e:
         return {"error": str(e), "app_status": "error"}
 
-@app.get("/debug")
-async def debug_info():
-    """Enhanced debug endpoint - fallback"""
-    return await debug_info_v1()
-
 @app.on_event("shutdown")
 async def shutdown_event():
     """Enhanced cleanup on shutdown"""
@@ -697,5 +653,5 @@ async def shutdown_event():
 
 if _name_ == "_main_":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))  # Changed default to 8000
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
