@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 import time
 import gc
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
@@ -371,8 +371,10 @@ async def debug_info():
     }
 
 # Add a catch-all route for debugging
+from fastapi import Request
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def catch_all(path: str, request):
+async def catch_all(path: str, request: Request):
     """Catch-all route to see what requests are being made"""
     return {
         "error": f"Route not found: {request.method} /{path}",
