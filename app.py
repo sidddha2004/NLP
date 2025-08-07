@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import time
 import gc
 
@@ -56,7 +56,7 @@ pinecone_client = None
 pc_index = None
 
 class QueryRequest(BaseModel):
-    document_url: HttpUrl
+    document_url: Optional[HttpUrl] = None
     questions: List[str]
 
 class Answer(BaseModel):
@@ -304,26 +304,37 @@ async def process_query_logic(request: QueryRequest):
     try:
         start_time = time.time()
         
-        # Extract text from PDF
-        logger.info(f"Processing document: {request.document_url}")
-        pdf_text = extract_text_from_pdf(str(request.document_url))
-        
-        # Chunk the text
-        chunks = chunk_text(pdf_text)
-        logger.info(f"Created {len(chunks)} chunks")
-        
-        # Generate embeddings
-        embeddings = generate_embeddings(chunks)
-        
-        # Store in Pinecone with unique doc ID
-        doc_id = f"doc_{int(time.time())}"
-        store_embeddings_in_pinecone(chunks, embeddings, doc_id)
+        # Only process document if URL is provided
+        if request.document_url:
+            # Extract text from PDF
+            logger.info(f"Processing document: {request.document_url}")
+            pdf_text = extract_text_from_pdf(str(request.document_url))
+            
+            # Chunk the text
+            chunks = chunk_text(pdf_text)
+            logger.info(f"Created {len(chunks)} chunks")
+            
+            # Generate embeddings
+            embeddings = generate_embeddings(chunks)
+            
+            # Store in Pinecone with unique doc ID
+            doc_id = f"doc_{int(time.time())}"
+            store_embeddings_in_pinecone(chunks, embeddings, doc_id)
+            logger.info(f"Indexed new document with ID: {doc_id}")
+        else:
+            logger.info("No document URL provided, searching existing index")
         
         # Process questions in parallel
         async def process_question(question: str) -> Answer:
             try:
-                # Search for relevant contexts
+                # Search for relevant contexts (from existing index or newly added document)
                 contexts = search_similar_chunks(question)
+                
+                if not contexts:
+                    return Answer(
+                        question=question, 
+                        answer="No relevant information found in the indexed documents."
+                    )
                 
                 # Generate answer
                 answer_text = generate_answer_with_gemini(question, contexts)
@@ -408,7 +419,7 @@ async def catch_all(path: str, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 8000))
     logger.info(f"Starting server on port {port}")
     logger.info(f"Available routes:")
     for route in app.routes:
