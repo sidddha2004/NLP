@@ -408,7 +408,7 @@ async def catch_all(path: str, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8080))
     logger.info(f"Starting server on port {port}")
     logger.info(f"Available routes:")
     for route in app.routes:
