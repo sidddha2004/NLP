@@ -4,7 +4,8 @@ import logging
 from typing import List, Dict, Any, Optional
 import time
 import gc
-import hashlib
+import re
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -24,10 +25,10 @@ import tiktoken
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app with more explicit configuration
+# Initialize FastAPI app
 app = FastAPI(
     title="Railway Semantic Search API", 
-    version="1.0.0",
+    version="2.0.0",
     debug=True,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -60,11 +61,12 @@ class QueryRequest(BaseModel):
     document_url: Optional[HttpUrl] = None
     questions: List[str]
 
-class Answer(BaseModel):
-    answer: str
-
 class QueryResponse(BaseModel):
     answers: List[str]
+
+class SearchDebugRequest(BaseModel):
+    query: str
+    top_k: Optional[int] = 10
 
 # Authentication middleware
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -77,25 +79,20 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
         )
     return token
 
-# Initialize models and connections
 def initialize_models():
+    """Initialize models and connections"""
     global embedding_model, pinecone_client, pc_index
     
     try:
-        # Initialize Gemini
-        if not API_BEARER_TOKEN:
-            raise ValueError("API_BEARER_TOKEN not found in environment variables")
-        # Initialize Gemini API
         if not GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Initialize embedding model (no API key needed - open source model)
+        # Initialize embedding model with exact same settings as Phase 1
         logger.info("Loading paraphrase-MiniLM-L6-v2 model...")
         embedding_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
         logger.info("Embedding model loaded successfully")
         
-        # Initialize Pinecone
         if not PINECONE_API_KEY:
             raise ValueError("PINECONE_API_KEY not found in environment variables")
         
@@ -107,192 +104,194 @@ def initialize_models():
         logger.error(f"Error initializing models: {e}")
         raise
 
-def extract_text_from_pdf(pdf_url: str) -> str:
-    """Extract text from PDF URL"""
-    try:
-        response = requests.get(pdf_url, timeout=30)
-        response.raise_for_status()
-        
-        pdf_file = BytesIO(response.content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        
-        return text.strip()
-    except Exception as e:
-        logger.error(f"Error extracting PDF text: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to extract PDF text: {str(e)}")
+def preprocess_query(query: str) -> str:
+    """Preprocess query to match document preprocessing"""
+    # Clean the query similar to how documents were processed
+    query = re.sub(r'\s+', ' ', query)
+    query = query.strip()
+    return query
 
-def chunk_text(text: str, chunk_size: 400, overlap: 50) -> List[str]:
-    """Chunk text with overlap using tiktoken for token counting"""
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        tokens = encoding.encode(text)
-        
-        chunks = []
-        start = 0
-        
-        while start < len(tokens):
-            end = start + chunk_size
-            chunk_tokens = tokens[start:end]
-            chunk_text = encoding.decode(chunk_tokens)
-            chunks.append(chunk_text)
-            
-            if end >= len(tokens):
-                break
-            
-            start = end - overlap
-        
-        return chunks
-    except Exception as e:
-        logger.error(f"Error chunking text: {e}")
-        # Fallback to simple text chunking
-        words = text.split()
-        chunk_size_words = chunk_size // 4  # Rough approximation
-        overlap_words = overlap // 4
-        
-        chunks = []
-        start = 0
-        while start < len(words):
-            end = start + chunk_size_words
-            chunk = " ".join(words[start:end])
-            chunks.append(chunk)
-            
-            if end >= len(words):
-                break
-            
-            start = end - overlap_words
-        
-        return chunks
+def expand_query(query: str) -> List[str]:
+    """Create query variations for better matching"""
+    variations = [query]
+    
+    # Add simplified version
+    simple_query = re.sub(r'[^\w\s]', ' ', query.lower())
+    simple_query = re.sub(r'\s+', ' ', simple_query).strip()
+    if simple_query != query.lower():
+        variations.append(simple_query)
+    
+    # Add key terms only
+    words = simple_query.split()
+    if len(words) > 3:
+        key_terms = ' '.join(words[:3])  # First 3 words
+        variations.append(key_terms)
+    
+    return list(set(variations))  # Remove duplicates
 
-def generate_embeddings(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for text chunks"""
+def advanced_search_similar_chunks(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+    """Advanced search with multiple strategies"""
     try:
-        embeddings = embedding_model.encode(texts, convert_to_tensor=False)
-        return embeddings.tolist()
-    except Exception as e:
-        logger.error(f"Error generating embeddings: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {str(e)}")
-
-def store_embeddings_in_pinecone(chunks: List[str], embeddings: List[List[float]], doc_id: str):
-    """Store embeddings in Pinecone"""
-    try:
-        vectors = []
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            vectors.append({
-                "id": f"{doc_id}_chunk_{i}",
-                "values": embedding,
-                "metadata": {
-                    "text": chunk[:1000],  # Limit metadata size
-                    "doc_id": doc_id,
-                    "chunk_index": i
-                }
-            })
+        logger.info(f"Advanced search for query: '{query}'")
         
-        # Upsert in batches
-        batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            pc_index.upsert(vectors=batch)
+        # Preprocess query
+        processed_query = preprocess_query(query)
+        query_variations = expand_query(processed_query)
         
-        logger.info(f"Stored {len(vectors)} vectors in Pinecone")
+        all_results = []
         
-    except Exception as e:
-        logger.error(f"Error storing embeddings: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to store embeddings: {str(e)}")
-
-def search_similar_chunks(query: str, top_k: int = 15) -> List[str]:
-    """Search for similar chunks in Pinecone - FIXED VERSION"""
-    try:
-        logger.info(f"Searching for query: '{query}'")
-        
-        # Generate query embedding using the SAME model as indexing
-        query_embedding = embedding_model.encode([query], convert_to_tensor=False)[0].tolist()
-        
-        # Search in Pinecone
-        search_results = pc_index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            include_values=False  # Don't need the vectors back
-        )
-        
-        logger.info(f"Pinecone returned {len(search_results.matches)} matches")
-        
-        # Log all results for debugging
-        contexts = []
-        for i, match in enumerate(search_results.matches):
-            score = match.score
-            text = match.metadata.get('text', '') if match.metadata else ''
-            logger.info(f"Match {i}: ID={match.id}, Score={score:.4f}, Text preview: {text[:100]}...")
+        # Search with each query variation
+        for i, query_var in enumerate(query_variations):
+            logger.info(f"Searching with variation {i+1}: '{query_var}'")
             
-            # SIGNIFICANTLY lowered threshold - was 0.3, now 0.1
-            if score > 0.1:
-                contexts.append(text)
-                logger.info(f"✓ Added context {i} with score {score:.4f}")
-            else:
-                logger.info(f"✗ Rejected context {i} with score {score:.4f} (below 0.1 threshold)")
+            # Generate embedding with same normalization as indexing
+            query_embedding = embedding_model.encode(
+                [query_var], 
+                convert_to_tensor=False,
+                normalize_embeddings=True  # Match indexing normalization
+            )[0].tolist()
+            
+            # Search in Pinecone
+            search_results = pc_index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True,
+                include_values=False
+            )
+            
+            # Collect results with query variant info
+            for match in search_results.matches:
+                if match.metadata:
+                    all_results.append({
+                        'id': match.id,
+                        'score': match.score,
+                        'text': match.metadata.get('text', ''),
+                        'doc_id': match.metadata.get('doc_id', ''),
+                        'chunk_index': match.metadata.get('chunk_index', 0),
+                        'query_variant': i,
+                        'metadata': match.metadata
+                    })
         
-        if not contexts:
-            logger.warning("No contexts found above threshold!")
-            # If no good matches, take the top 3 anyway for debugging
-            for match in search_results.matches[:3]:
-                if match.metadata and match.metadata.get('text'):
-                    contexts.append(match.metadata['text'])
-                    logger.info(f"Added fallback context with score {match.score:.4f}")
+        # Remove duplicates and sort by score
+        seen_ids = set()
+        unique_results = []
+        for result in sorted(all_results, key=lambda x: x['score'], reverse=True):
+            if result['id'] not in seen_ids:
+                seen_ids.add(result['id'])
+                unique_results.append(result)
         
-        logger.info(f"Returning {len(contexts)} contexts total")
-        return contexts
+        # Log results for debugging
+        logger.info(f"Found {len(unique_results)} unique matches")
+        for i, result in enumerate(unique_results[:5]):
+            logger.info(f"  Match {i}: ID={result['id']}, Score={result['score']:.4f}, "
+                       f"Query variant={result['query_variant']}")
+            logger.info(f"    Text preview: {result['text'][:100]}...")
+        
+        return unique_results
         
     except Exception as e:
-        logger.error(f"Error searching chunks: {e}")
+        logger.error(f"Error in advanced search: {e}")
         return []
 
-def generate_answer_with_gemini(question: str, contexts: List[str]) -> str:
-    """Generate answer using Gemini 1.5 Flash - IMPROVED VERSION"""
+def filter_and_rank_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
+    """Filter and rank contexts using multiple criteria"""
+    if not search_results:
+        return []
+    
+    # Multiple filtering strategies
+    contexts = []
+    
+    # Strategy 1: High similarity score
+    high_score_results = [r for r in search_results if r['score'] > 0.15]
+    logger.info(f"High score results (>0.15): {len(high_score_results)}")
+    
+    # Strategy 2: Keyword matching
+    query_words = set(query.lower().split())
+    keyword_results = []
+    for result in search_results[:15]:  # Check top 15
+        text_words = set(result['text'].lower().split())
+        overlap = len(query_words.intersection(text_words))
+        if overlap >= 2 or result['score'] > 0.1:  # At least 2 word overlap or decent score
+            keyword_results.append(result)
+    
+    logger.info(f"Keyword matching results: {len(keyword_results)}")
+    
+    # Combine strategies
+    combined_results = high_score_results if high_score_results else keyword_results
+    
+    # If still no results, take top scoring ones anyway
+    if not combined_results and search_results:
+        combined_results = search_results[:5]
+        logger.info("Using fallback: top 5 results regardless of score")
+    
+    # Extract contexts
+    for result in combined_results[:10]:  # Top 10 contexts max
+        if result['text'] and len(result['text'].strip()) > 50:
+            contexts.append(result['text'])
+    
+    logger.info(f"Final contexts selected: {len(contexts)}")
+    return contexts
+
+def generate_comprehensive_answer(question: str, contexts: List[str]) -> str:
+    """Generate comprehensive answer with improved prompting"""
     try:
-        # Use more contexts for better answers
-        context_text = "\n\n".join(contexts[:5])  # Use top 5 contexts instead of 3
+        if not contexts:
+            return "I couldn't find relevant information in the indexed documents to answer this question."
         
-        logger.info(f"Generating answer for: {question}")
+        # Prepare context with better formatting
+        numbered_contexts = []
+        for i, context in enumerate(contexts[:7], 1):  # Use up to 7 contexts
+            numbered_contexts.append(f"Context {i}:\n{context}\n")
+        
+        context_text = "\n".join(numbered_contexts)
+        
+        logger.info(f"Generating answer for: '{question}'")
         logger.info(f"Using {len(contexts)} contexts, total length: {len(context_text)} chars")
         
-        prompt = f"""Based on the following context from documents, provide a comprehensive and accurate answer to the question. If you cannot find the specific information in the context, try to provide related information that might be helpful, and clearly state what information is missing.
+        # Improved prompt with specific instructions
+        prompt = f"""You are a helpful AI assistant. Based on the provided contexts from documents, answer the user's question comprehensively and accurately.
 
-Context:
+CONTEXTS:
 {context_text}
 
-Question: {question}
+QUESTION: {question}
 
-Answer (be specific and detailed):"""
+INSTRUCTIONS:
+1. Provide a detailed answer based on the information found in the contexts
+2. If you find relevant information, synthesize it from multiple contexts if needed
+3. Be specific and cite relevant details
+4. If the exact answer isn't available but related information exists, provide that and explain what's missing
+5. Only say you cannot answer if absolutely no relevant information is found
+6. Structure your answer clearly with key points
+
+ANSWER:"""
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={
-                'temperature': 0.2,  # Slightly higher for more natural responses
+                'temperature': 0.3,
                 'top_p': 0.9,
                 'top_k': 40,
-                'max_output_tokens': 1024,
+                'max_output_tokens': 2048,
             }
         )
         
         answer = response.text.strip()
-        logger.info(f"Generated answer: {answer[:100]}...")
+        logger.info(f"Generated answer length: {len(answer)} chars")
+        logger.info(f"Answer preview: {answer[:150]}...")
+        
         return answer
         
     except Exception as e:
-        logger.error(f"Error generating answer with Gemini: {e}")
+        logger.error(f"Error generating answer: {e}")
         return f"Error generating answer: {str(e)}"
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on startup"""
     logger.info("=== APPLICATION STARTUP ===")
-    logger.info(f"PORT: {os.getenv('PORT', '8000')}")
-    logger.info(f"Environment variables check:")
+    logger.info(f"Environment variables:")
     logger.info(f"  API_BEARER_TOKEN: {'SET' if API_BEARER_TOKEN else 'MISSING'}")
     logger.info(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
     logger.info(f"  PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
@@ -309,131 +308,145 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": time.time()}
 
-@app.get("/test")
-async def test_endpoint():
-    """Simple test endpoint - no auth required"""
-    return {"message": "API is working!", "timestamp": time.time()}
-
-# NEW DEBUG ENDPOINT
-@app.post("/test-search")
-async def test_search_endpoint(
-    query: str,
+@app.post("/debug-search")
+async def debug_search_endpoint(
+    request: SearchDebugRequest,
     token: str = Depends(verify_token)
 ):
-    """Debug endpoint to test search functionality"""
+    """Enhanced debug endpoint for search testing"""
     try:
-        contexts = search_similar_chunks(query, top_k=10)
+        # Get search results
+        search_results = advanced_search_similar_chunks(request.query, request.top_k)
+        
+        # Get index stats
+        index_stats = pc_index.describe_index_stats()
+        
+        # Process contexts
+        contexts = filter_and_rank_contexts(search_results, request.query)
+        
         return {
-            "query": query,
-            "contexts_found": len(contexts),
-            "contexts": contexts[:3],  # Return first 3 for inspection
-            "index_stats": pc_index.describe_index_stats()
+            "query": request.query,
+            "query_variations": expand_query(preprocess_query(request.query)),
+            "index_stats": {
+                "total_vectors": index_stats.total_vector_count,
+                "dimension": index_stats.dimension,
+                "namespaces": index_stats.namespaces
+            },
+            "search_results": {
+                "total_matches": len(search_results),
+                "matches": [
+                    {
+                        "id": r['id'],
+                        "score": r['score'],
+                        "doc_id": r['doc_id'],
+                        "text_preview": r['text'][:200] + "..." if len(r['text']) > 200 else r['text']
+                    }
+                    for r in search_results[:5]
+                ]
+            },
+            "filtered_contexts": {
+                "count": len(contexts),
+                "contexts": [ctx[:300] + "..." if len(ctx) > 300 else ctx for ctx in contexts[:3]]
+            }
         }
     except Exception as e:
-        logger.error(f"Error in test search: {e}")
+        logger.error(f"Error in debug search: {e}")
         return {"error": str(e)}
-
-@app.post("/api/hackrx/run", response_model=QueryResponse)
-async def process_query_api(
-    request: QueryRequest,
-    token: str = Depends(verify_token)
-):
-    """Main API endpoint for processing queries (original path)"""
-    return await process_query_logic(request)
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """Main endpoint for processing queries"""
-    return await process_query_logic(request)
-
-async def process_query_logic(request: QueryRequest):
-    """Shared logic for processing queries - IMPROVED VERSION"""
+    """Main endpoint for processing queries - ENHANCED VERSION"""
     try:
         start_time = time.time()
         
-        # Only process document if URL is provided
-        if request.document_url:
-            # Extract text from PDF
-            logger.info(f"Processing document: {request.document_url}")
-            pdf_text = extract_text_from_pdf(str(request.document_url))
-            
-            if not pdf_text.strip():
-                raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
-            
-            # Chunk the text
-            chunks = chunk_text(pdf_text)
-            logger.info(f"Created {len(chunks)} chunks from {len(pdf_text)} characters")
-            
-            # Generate embeddings
-            embeddings = generate_embeddings(chunks)
-            
-            # Store in Pinecone with unique doc ID
-            doc_id = f"doc_{int(time.time())}"
-            store_embeddings_in_pinecone(chunks, embeddings, doc_id)
-            logger.info(f"Indexed new document with ID: {doc_id}")
-        else:
-            logger.info("No document URL provided, searching existing index")
-        
-        # Check if index has data
+        # Check index status first
         index_stats = pc_index.describe_index_stats()
         total_vectors = index_stats.total_vector_count
-        logger.info(f"Pinecone index has {total_vectors} total vectors")
+        
+        logger.info(f"Processing {len(request.questions)} questions")
+        logger.info(f"Index contains {total_vectors} vectors")
         
         if total_vectors == 0:
-            logger.warning("Pinecone index is empty!")
-            return QueryResponse(answers=["The document index is empty. Please index some documents first."] * len(request.questions))
+            return QueryResponse(
+                answers=["The document index is empty. Please index some documents first."] * len(request.questions)
+            )
         
-        # Process questions in parallel
-        async def process_question(question: str) -> str:
+        # Handle document URL if provided
+        if request.document_url:
+            logger.info(f"Document URL provided: {request.document_url}")
+            # Add document processing logic here if needed
+            # For now, we'll search the existing index
+        
+        # Process each question
+        async def process_single_question(question: str) -> str:
             try:
-                logger.info(f"Processing question: {question}")
+                logger.info(f"\n--- Processing Question ---")
+                logger.info(f"Question: {question}")
                 
-                # Search for relevant contexts
-                contexts = search_similar_chunks(question, top_k=15)
+                # Advanced search
+                search_results = advanced_search_similar_chunks(question, top_k=25)
+                
+                if not search_results:
+                    logger.warning("No search results found")
+                    return f"I couldn't find any relevant information for the question: '{question}'"
+                
+                # Filter and rank contexts
+                contexts = filter_and_rank_contexts(search_results, question)
                 
                 if not contexts:
-                    logger.warning(f"No contexts found for question: {question}")
-                    return "I couldn't find relevant information in the indexed documents for this question."
+                    logger.warning("No contexts passed filtering")
+                    return f"I found some potentially related information, but it doesn't seem relevant enough to answer: '{question}'"
                 
                 # Generate answer
-                answer_text = generate_answer_with_gemini(question, contexts)
+                answer = generate_comprehensive_answer(question, contexts)
                 
-                return answer_text
+                logger.info(f"Successfully generated answer for: {question}")
+                return answer
+                
             except Exception as e:
                 logger.error(f"Error processing question '{question}': {e}")
-                return f"Error processing question: {str(e)}"
+                return f"Error processing the question '{question}': {str(e)}"
         
-        # Process all questions
-        tasks = [process_question(q) for q in request.questions]
+        # Process all questions concurrently
+        tasks = [process_single_question(q) for q in request.questions]
         answers = await asyncio.gather(*tasks)
         
-        # Clean up memory
+        # Clean up
         gc.collect()
         
         processing_time = time.time() - start_time
-        logger.info(f"Processed {len(request.questions)} questions in {processing_time:.2f}s")
+        logger.info(f"\n=== PROCESSING COMPLETE ===")
+        logger.info(f"Total time: {processing_time:.2f}s")
+        logger.info(f"Questions processed: {len(request.questions)}")
         
         return QueryResponse(answers=answers)
         
     except Exception as e:
-        logger.error(f"Error in process_query: {e}")
+        logger.error(f"Error in main processing: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/hackrx/run", response_model=QueryResponse)
+async def process_query_api(
+    request: QueryRequest,
+    token: str = Depends(verify_token)
+):
+    """Alternative endpoint path"""
+    return await process_query(request, token)
 
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API",
-        "version": "1.0.0",
+        "message": "Railway Semantic Search API - Enhanced Version",
+        "version": "2.0.0",
         "status": "active",
-        "available_endpoints": [
+        "endpoints": [
             "GET /",
             "GET /health",
-            "GET /debug",
-            "POST /test-search",
+            "POST /debug-search",
             "POST /hackrx/run",
             "POST /api/hackrx/run"
         ]
@@ -441,79 +454,36 @@ async def root():
 
 @app.get("/debug")
 async def debug_info():
-    """Debug endpoint to check app status - ENHANCED"""
+    """Enhanced debug endpoint"""
     try:
-        # Check Pinecone index stats
         index_stats = pc_index.describe_index_stats()
         
-        # Test embedding generation
-        test_embedding = embedding_model.encode(["test query"], convert_to_tensor=False)[0]
+        # Test embedding
+        test_embedding = embedding_model.encode(["test"], normalize_embeddings=True)[0]
         
         return {
             "app_status": "running",
-            "models_loaded": embedding_model is not None,
-            "pinecone_connected": pc_index is not None,
-            "embedding_model_working": len(test_embedding) > 0,
-            "embedding_dimension": len(test_embedding),
-            "pinecone_stats": {
-                "total_vectors": index_stats.total_vector_count,
-                "namespaces": index_stats.namespaces,
-                "dimension": index_stats.dimension
+            "version": "2.0.0",
+            "models": {
+                "embedding_loaded": embedding_model is not None,
+                "embedding_dimension": len(test_embedding),
+                "pinecone_connected": pc_index is not None
             },
-            "available_routes": [str(route.path) for route in app.routes],
-            "environment_vars": {
-                "API_BEARER_TOKEN": "***" if API_BEARER_TOKEN else "MISSING",
-                "GEMINI_API_KEY": "***" if GEMINI_API_KEY else "MISSING",
-                "PINECONE_API_KEY": "***" if PINECONE_API_KEY else "MISSING",
-                "PORT": os.getenv("PORT", "8000")
+            "index_stats": {
+                "total_vectors": index_stats.total_vector_count,
+                "dimension": index_stats.dimension,
+                "namespaces": index_stats.namespaces
+            },
+            "config": {
+                "API_BEARER_TOKEN": "SET" if API_BEARER_TOKEN else "MISSING",
+                "GEMINI_API_KEY": "SET" if GEMINI_API_KEY else "MISSING",
+                "PINECONE_API_KEY": "SET" if PINECONE_API_KEY else "MISSING"
             }
         }
     except Exception as e:
-        return {
-            "error": str(e),
-            "app_status": "running",
-            "models_loaded": embedding_model is not None,
-            "pinecone_connected": pc_index is not None
-        }
-
-# Add a catch-all route for debugging
-from fastapi import Request
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def catch_all(path: str, request: Request):
-    """Catch-all route to see what requests are being made"""
-    return {
-        "error": f"Route not found: {request.method} /{path}",
-        "available_routes": [
-            "GET /",
-            "GET /health", 
-            "GET /test",
-            "GET /debug",
-            "GET /docs",
-            "POST /test-search",
-            "POST /hackrx/run",
-            "POST /api/hackrx/run"
-        ],
-        "request_info": {
-            "method": request.method,
-            "path": path,
-            "headers": dict(request.headers)
-        }
-    }
+        return {"error": str(e), "app_status": "error"}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
-    logger.info(f"Starting server on port {port}")
-    logger.info(f"Available routes:")
-    for route in app.routes:
-        logger.info(f"  {route.methods if hasattr(route, 'methods') else 'N/A'} {route.path}")
-    
-    uvicorn.run(
-        "app:app", 
-        host="0.0.0.0", 
-        port=port, 
-        reload=False, 
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
