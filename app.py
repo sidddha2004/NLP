@@ -651,7 +651,7 @@ async def shutdown_event():
     search_cache.clear()
     auth_cache.clear()
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
