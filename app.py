@@ -23,8 +23,14 @@ import tiktoken
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(title="Railway Semantic Search API", version="1.0.0")
+# Initialize FastAPI app with more explicit configuration
+app = FastAPI(
+    title="Railway Semantic Search API", 
+    version="1.0.0",
+    debug=True,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 # CORS middleware
 app.add_middleware(
@@ -253,12 +259,29 @@ Answer:"""
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on startup"""
-    initialize_models()
+    logger.info("=== APPLICATION STARTUP ===")
+    logger.info(f"PORT: {os.getenv('PORT', '8000')}")
+    logger.info(f"Environment variables check:")
+    logger.info(f"  API_BEARER_TOKEN: {'SET' if API_BEARER_TOKEN else 'MISSING'}")
+    logger.info(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
+    logger.info(f"  PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
+    
+    try:
+        initialize_models()
+        logger.info("=== STARTUP COMPLETE ===")
+    except Exception as e:
+        logger.error(f"=== STARTUP FAILED: {e} ===")
+        raise
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": time.time()}
+
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint - no auth required"""
+    return {"message": "API is working!", "timestamp": time.time()}
 
 @app.post("/api/hackrx/run", response_model=QueryResponse)
 async def process_query(
@@ -338,6 +361,7 @@ async def debug_info():
         "app_status": "running",
         "models_loaded": embedding_model is not None,
         "pinecone_connected": pc_index is not None,
+        "available_routes": [str(route.path) for route in app.routes],
         "environment_vars": {
             "API_BEARER_TOKEN": "***" if API_BEARER_TOKEN else "MISSING",
             "GEMINI_API_KEY": "***" if GEMINI_API_KEY else "MISSING",
@@ -346,8 +370,40 @@ async def debug_info():
         }
     }
 
+# Add a catch-all route for debugging
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def catch_all(path: str, request):
+    """Catch-all route to see what requests are being made"""
+    return {
+        "error": f"Route not found: {request.method} /{path}",
+        "available_routes": [
+            "GET /",
+            "GET /health", 
+            "GET /test",
+            "GET /debug",
+            "GET /docs",
+            "POST /api/hackrx/run"
+        ],
+        "request_info": {
+            "method": request.method,
+            "path": path,
+            "headers": dict(request.headers)
+        }
+    }
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     logger.info(f"Starting server on port {port}")
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    logger.info(f"Available routes:")
+    for route in app.routes:
+        logger.info(f"  {route.methods if hasattr(route, 'methods') else 'N/A'} {route.path}")
+    
+    uvicorn.run(
+        "app:app", 
+        host="0.0.0.0", 
+        port=port, 
+        reload=False, 
+        log_level="info",
+        access_log=True
+    )
