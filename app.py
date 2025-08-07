@@ -7,6 +7,7 @@ import gc
 import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Railway Semantic Search API", 
     version="2.2.0",
-    debug=False,  # Disable debug mode for production
+    debug=False,
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -57,11 +58,11 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 embedding_model = None
 pinecone_client = None
 pc_index = None
-executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=6)  # Increased for better concurrency
 
+# Updated request model to match your format
 class QueryRequest(BaseModel):
-    document_url: Optional[HttpUrl] = None
-    documents: Optional[str] = None  # Support both formats
+    documents: Optional[str] = None  # Ignored in Phase 2
     questions: List[str]
 
 class QueryResponse(BaseModel):
@@ -110,7 +111,7 @@ def initialize_models():
         raise
 
 def preprocess_query(query: str) -> str:
-    """Preprocess query to match document preprocessing"""
+    """Preprocess query to match document preprocessing - UNCHANGED to maintain compatibility"""
     # Clean the query similar to how documents were processed
     query = re.sub(r'\s+', ' ', query)
     query = query.strip()
@@ -118,7 +119,7 @@ def preprocess_query(query: str) -> str:
 
 # Async wrapper for embedding generation
 async def generate_embedding_async(text: str) -> List[float]:
-    """Generate embedding asynchronously using thread pool"""
+    """Generate embedding asynchronously using thread pool - UNCHANGED to maintain compatibility"""
     loop = asyncio.get_event_loop()
     
     def _generate_embedding():
@@ -126,179 +127,179 @@ async def generate_embedding_async(text: str) -> List[float]:
             [text], 
             convert_to_tensor=False,
             normalize_embeddings=True,
-            show_progress_bar=False  # Disable progress bar for speed
+            show_progress_bar=False
         )[0].tolist()
     
     return await loop.run_in_executor(executor, _generate_embedding)
 
-async def fast_search_similar_chunks(query: str, top_k: int = 12) -> List[Dict[str, Any]]:
-    """Optimized search with better accuracy and minimal variations"""
+async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Dict[str, Any]]:
+    """Enhanced search with better result processing"""
     try:
         logger.info(f"Searching for: '{query}'")
         
-        # Preprocess query
+        # Preprocess query (unchanged to maintain compatibility)
         processed_query = preprocess_query(query)
         
-        # Generate two query variants for better recall
-        query_variants = [processed_query]
+        # Generate embedding asynchronously (unchanged)
+        query_embedding = await generate_embedding_async(processed_query)
         
-        # Add a simplified variant for better matching
-        simple_query = re.sub(r'[^\w\s]', ' ', processed_query.lower())
-        simple_query = re.sub(r'\s+', ' ', simple_query).strip()
-        if simple_query != processed_query.lower() and len(processed_query.split()) > 2:
-            query_variants.append(simple_query)
+        # Search with slightly higher top_k for better selection
+        search_results = pc_index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True,
+            include_values=False
+        )
         
-        all_results = []
+        # Enhanced result processing
+        results = []
+        query_words = set(query.lower().split())
         
-        # Search with both variants but process efficiently
-        for i, query_var in enumerate(query_variants):
-            # Generate embedding asynchronously
-            query_embedding = await generate_embedding_async(query_var)
-            
-            # Pinecone search with optimized parameters
-            search_results = pc_index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-                include_values=False
-            )
-            
-            # Process results quickly
-            for match in search_results.matches:
-                if match.metadata and match.score > 0.08:  # Lower threshold for better recall
-                    all_results.append({
-                        'id': match.id,
-                        'score': match.score,
-                        'text': match.metadata.get('text', ''),
-                        'doc_id': match.metadata.get('doc_id', ''),
-                        'chunk_index': match.metadata.get('chunk_index', 0),
-                        'query_variant': i
-                    })
+        for match in search_results.matches:
+            if match.metadata and match.score > 0.08:  # Slightly lower threshold
+                text = match.metadata.get('text', '')
+                
+                # Calculate keyword overlap bonus
+                text_words = set(text.lower().split())
+                keyword_overlap = len(query_words.intersection(text_words)) / len(query_words) if query_words else 0
+                
+                # Enhanced scoring
+                enhanced_score = match.score + (keyword_overlap * 0.1)
+                
+                results.append({
+                    'id': match.id,
+                    'score': match.score,
+                    'enhanced_score': enhanced_score,
+                    'text': text,
+                    'doc_id': match.metadata.get('doc_id', ''),
+                    'chunk_index': match.metadata.get('chunk_index', 0),
+                    'keyword_overlap': keyword_overlap
+                })
         
-        # Quick deduplication while preserving best scores
-        seen_ids = {}
-        for result in all_results:
-            if result['id'] not in seen_ids or result['score'] > seen_ids[result['id']]['score']:
-                seen_ids[result['id']] = result
+        # Sort by enhanced score
+        results.sort(key=lambda x: x['enhanced_score'], reverse=True)
         
-        # Sort by score and return top results
-        unique_results = sorted(seen_ids.values(), key=lambda x: x['score'], reverse=True)[:top_k]
-        
-        logger.info(f"Found {len(unique_results)} unique matches")
-        return unique_results
+        logger.info(f"Found {len(results)} matches")
+        return results
         
     except Exception as e:
         logger.error(f"Error in search: {e}")
         return []
 
-def smart_filter_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Enhanced context filtering with better accuracy"""
+def smart_context_selection(search_results: List[Dict[str, Any]], query: str) -> List[str]:
+    """Smarter context selection with improved filtering"""
     if not search_results:
         return []
     
     contexts = []
     query_lower = query.lower()
-    query_words = set(query_lower.split())
+    query_keywords = set(query_lower.split())
     
-    # Score contexts based on multiple criteria
-    scored_contexts = []
-    
-    for result in search_results[:8]:  # Check more results for better accuracy
-        score = result['score']
+    # Enhanced context selection logic
+    for result in search_results:
         text = result['text']
-        text_lower = text.lower()
-        text_words = set(text_lower.split())
+        score = result['enhanced_score']
+        keyword_overlap = result.get('keyword_overlap', 0)
         
-        # Calculate enhanced relevance score
-        relevance_score = score
+        # Multi-tier selection criteria
+        if score > 0.3 and keyword_overlap > 0.3:  # High confidence
+            contexts.append(text)
+        elif score > 0.2 and keyword_overlap > 0.2:  # Medium confidence
+            contexts.append(text)
+        elif score > 0.15 and keyword_overlap > 0.1:  # Lower confidence but some relevance
+            # Additional check for important terms
+            important_terms = ['policy', 'coverage', 'premium', 'benefit', 'waiting', 'period', 
+                             'mediclaim', 'insurance', 'claim', 'discount', 'hospital']
+            if any(term in text.lower() for term in important_terms):
+                contexts.append(text)
         
-        # Boost score for exact phrase matches
-        if query_lower in text_lower:
-            relevance_score += 0.1
-        
-        # Boost score for keyword overlap
-        word_overlap = len(query_words.intersection(text_words))
-        if len(query_words) > 0:
-            overlap_ratio = word_overlap / len(query_words)
-            relevance_score += overlap_ratio * 0.05
-        
-        # Boost score for important keywords (domain-specific terms)
-        important_keywords = ['railway', 'train', 'station', 'track', 'signal', 'safety', 'maintenance', 'schedule',
-                             'policy', 'premium', 'mediclaim', 'insurance', 'coverage', 'claim', 'benefit', 'waiting', 'period']
-        for keyword in important_keywords:
-            if keyword in text_lower and keyword in query_lower:
-                relevance_score += 0.02
-        
-        scored_contexts.append({
-            'text': text,
-            'relevance_score': relevance_score,
-            'original_score': score
-        })
-    
-    # Sort by enhanced relevance score
-    scored_contexts.sort(key=lambda x: x['relevance_score'], reverse=True)
-    
-    # Select contexts with adaptive thresholds
-    for ctx in scored_contexts:
-        if len(contexts) >= 5:  # Limit to 5 contexts for balance
+        # Limit contexts but allow more for complex queries
+        max_contexts = 6 if len(query.split()) > 8 else 5
+        if len(contexts) >= max_contexts:
             break
-            
-        if ctx['relevance_score'] > 0.15:  # High relevance
-            contexts.append(ctx['text'])
-        elif ctx['relevance_score'] > 0.12 and len(contexts) < 3:  # Medium relevance, ensure minimum contexts
-            contexts.append(ctx['text'])
     
-    # Ensure we have at least one context if results exist
-    if not contexts and scored_contexts:
-        contexts = [scored_contexts[0]['text']]
-        logger.info("Using fallback context with highest score")
+    # Fallback with best result
+    if not contexts and search_results:
+        contexts = [search_results[0]['text']]
+        logger.info("Using fallback context")
     
-    logger.info(f"Selected {len(contexts)} contexts with enhanced filtering")
+    logger.info(f"Selected {len(contexts)} contexts with improved filtering")
     return contexts
 
-async def generate_fast_answer(question: str, contexts: List[str]) -> str:
-    """Generate answers with optimized Gemini settings"""
+async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
+    """Enhanced answer generation with better prompting"""
     try:
         if not contexts:
             return "I couldn't find relevant information in the indexed documents to answer this question."
         
-        # Use only top 3 contexts and limit their length
-        selected_contexts = contexts[:3]
-        context_text = "\n\n".join([f"Context {i+1}: {ctx[:300]}" for i, ctx in enumerate(selected_contexts)])
+        # Use more contexts but truncate smartly
+        selected_contexts = contexts[:4]  # Increased from 3
         
-        logger.info(f"Generating answer with {len(selected_contexts)} contexts")
+        # Smart truncation - keep important parts
+        processed_contexts = []
+        for i, ctx in enumerate(selected_contexts):
+            if len(ctx) > 400:  # Increased from 300
+                # Try to keep the most relevant part
+                sentences = ctx.split('. ')
+                relevant_sentences = []
+                question_words = set(question.lower().split())
+                
+                for sentence in sentences:
+                    sentence_words = set(sentence.lower().split())
+                    if question_words.intersection(sentence_words):
+                        relevant_sentences.append(sentence)
+                
+                if relevant_sentences:
+                    ctx = '. '.join(relevant_sentences[:2])  # Keep top 2 relevant sentences
+                else:
+                    ctx = ctx[:400]  # Fallback to truncation
+            
+            processed_contexts.append(f"Context {i+1}: {ctx}")
         
-        # Optimized prompt for speed and conciseness
-        prompt = f"""Answer the question directly and concisely based on the provided contexts.
+        context_text = "\n\n".join(processed_contexts)
+        
+        logger.info(f"Generating answer with {len(selected_contexts)} enhanced contexts")
+        
+        # Improved prompt for better accuracy
+        prompt = f"""You are an expert insurance policy analyst. Answer the question accurately and concisely based on the provided contexts from insurance policy documents.
 
 CONTEXTS:
 {context_text}
 
 QUESTION: {question}
 
-Provide a direct answer in 2-3 sentences maximum. Be specific and factual.
+Instructions:
+- Provide a direct, factual answer based on the contexts
+- Be specific about numbers, periods, percentages, and conditions
+- If the information is not in the contexts, state that clearly
+- Keep the answer concise but complete (2-4 sentences)
+- Focus on the exact details requested in the question
 
 ANSWER:"""
 
-        # Run Gemini API call in thread pool to avoid blocking
+        # Run Gemini API call in thread pool
         loop = asyncio.get_event_loop()
         
         def _generate_content():
-            model = genai.GenerativeModel('gemini-2.0-flash')
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
             response = model.generate_content(
                 prompt,
                 generation_config={
-                    'temperature': 0.1,
-                    'top_p': 0.8,
-                    'top_k': 20,
-                    'max_output_tokens': 256,  # Further reduced for speed
+                    'temperature': 0.05,  # Lower for more consistent answers
+                    'top_p': 0.7,        # More focused
+                    'top_k': 15,         # More focused
+                    'max_output_tokens': 300,  # Slightly increased for complete answers
                 }
             )
             return response.text.strip()
         
         answer = await loop.run_in_executor(executor, _generate_content)
         
-        logger.info(f"Generated answer: {len(answer)} chars")
+        # Post-process answer for consistency
+        answer = re.sub(r'\n+', ' ', answer)  # Remove multiple newlines
+        answer = re.sub(r'\s+', ' ', answer)  # Normalize spaces
+        
+        logger.info(f"Generated enhanced answer: {len(answer)} chars")
         return answer
         
     except Exception as e:
@@ -334,13 +335,13 @@ async def debug_search_endpoint(
     """Debug endpoint for search testing"""
     try:
         # Get search results
-        search_results = await fast_search_similar_chunks(request.query, request.top_k)
+        search_results = await enhanced_search_similar_chunks(request.query, request.top_k)
         
         # Get index stats
         index_stats = pc_index.describe_index_stats()
         
         # Process contexts
-        contexts = smart_filter_contexts(search_results, request.query)
+        contexts = smart_context_selection(search_results, request.query)
         
         return {
             "query": request.query,
@@ -354,6 +355,8 @@ async def debug_search_endpoint(
                     {
                         "id": r['id'],
                         "score": r['score'],
+                        "enhanced_score": r['enhanced_score'],
+                        "keyword_overlap": r['keyword_overlap'],
                         "doc_id": r['doc_id'],
                         "text_preview": r['text'][:150] + "..." if len(r['text']) > 150 else r['text']
                     }
@@ -374,9 +377,13 @@ async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """Main endpoint for processing queries - SPEED OPTIMIZED VERSION"""
+    """Main endpoint for processing queries - ENHANCED VERSION"""
     try:
         start_time = time.time()
+        
+        # Log the document field (ignored as mentioned)
+        if request.documents:
+            logger.info(f"Document field received (ignored): {request.documents[:100]}...")
         
         # Quick index check
         index_stats = pc_index.describe_index_stats()
@@ -390,23 +397,23 @@ async def process_query(
                 answers=["The document index is empty. Please index some documents first."] * len(request.questions)
             )
         
-        # Process each question with optimized pipeline
+        # Enhanced question processing
         async def process_single_question(question: str) -> str:
             try:
                 question_start = time.time()
                 logger.info(f"Processing: {question}")
                 
-                # Fast search with better coverage
-                search_results = await fast_search_similar_chunks(question, top_k=8)
+                # Enhanced search with better result selection
+                search_results = await enhanced_search_similar_chunks(question, top_k=10)
                 
                 if not search_results:
                     return f"No relevant information found for: '{question}'"
                 
-                # Enhanced context filtering
-                contexts = smart_filter_contexts(search_results, question)
+                # Smart context selection
+                contexts = smart_context_selection(search_results, question)
                 
                 if not contexts:
-                    return f"Found potentially related information, but not relevant enough for: '{question}'"
+                    return f"Found potentially related information, but not specific enough for: '{question}'"
                 
                 # Generate enhanced answer
                 answer = await generate_enhanced_answer(question, contexts)
@@ -420,8 +427,8 @@ async def process_query(
                 logger.error(f"Error processing '{question}': {e}")
                 return f"Error processing: {str(e)}"
         
-        # Process questions with controlled concurrency
-        semaphore = asyncio.Semaphore(3)  # Limit concurrent processing
+        # Process questions with optimized concurrency
+        semaphore = asyncio.Semaphore(4)  # Slightly increased concurrency
         
         async def process_with_semaphore(question: str) -> str:
             async with semaphore:
@@ -455,10 +462,10 @@ async def process_query_api(
 async def root():
     """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API - Speed + Accuracy Optimized",
+        "message": "Railway Semantic Search API - Enhanced Version",
         "version": "2.2.0",
         "status": "active",
-        "optimizations": "Async processing, enhanced context filtering, better search coverage"
+        "enhancements": "Improved accuracy, smart context selection, enhanced scoring"
     }
 
 @app.get("/debug")
