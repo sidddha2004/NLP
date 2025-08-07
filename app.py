@@ -284,11 +284,23 @@ async def test_endpoint():
     return {"message": "API is working!", "timestamp": time.time()}
 
 @app.post("/api/hackrx/run", response_model=QueryResponse)
+async def process_query_api(
+    request: QueryRequest,
+    token: str = Depends(verify_token)
+):
+    """Main API endpoint for processing queries (original path)"""
+    return await process_query_logic(request)
+
+@app.post("/hackrx/run", response_model=QueryResponse)
 async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """Main API endpoint for processing queries"""
+    """Main endpoint for processing queries"""
+    return await process_query_logic(request)
+
+async def process_query_logic(request: QueryRequest):
+    """Shared logic for processing queries"""
     try:
         start_time = time.time()
         
@@ -384,6 +396,7 @@ async def catch_all(path: str, request: Request):
             "GET /test",
             "GET /debug",
             "GET /docs",
+            "POST /hackrx/run",
             "POST /api/hackrx/run"
         ],
         "request_info": {
