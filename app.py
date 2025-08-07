@@ -129,29 +129,35 @@ def expand_query(query: str) -> List[str]:
     
     return list(set(variations))  # Remove duplicates
 
-def advanced_search_similar_chunks(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-    """Advanced search with multiple strategies"""
+def advanced_search_similar_chunks(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
+    """Optimized search with reduced complexity for speed"""
     try:
-        logger.info(f"Advanced search for query: '{query}'")
+        logger.info(f"Searching for: '{query}'")
         
         # Preprocess query
         processed_query = preprocess_query(query)
-        query_variations = expand_query(processed_query)
+        
+        # Reduced to max 2 variations for speed
+        query_variations = [processed_query]
+        
+        # Add only one simplified variation if query is complex
+        simple_query = re.sub(r'[^\w\s]', ' ', processed_query.lower())
+        simple_query = re.sub(r'\s+', ' ', simple_query).strip()
+        if simple_query != processed_query.lower() and len(processed_query.split()) > 2:
+            query_variations.append(simple_query)
         
         all_results = []
         
-        # Search with each query variation
+        # Search with fewer variations
         for i, query_var in enumerate(query_variations):
-            logger.info(f"Searching with variation {i+1}: '{query_var}'")
-            
-            # Generate embedding with same normalization as indexing
+            # Generate embedding
             query_embedding = embedding_model.encode(
                 [query_var], 
                 convert_to_tensor=False,
-                normalize_embeddings=True  # Match indexing normalization
+                normalize_embeddings=True
             )[0].tolist()
             
-            # Search in Pinecone
+            # Single Pinecone search with higher top_k to get good results in one go
             search_results = pc_index.query(
                 vector=query_embedding,
                 top_k=top_k,
@@ -159,97 +165,76 @@ def advanced_search_similar_chunks(query: str, top_k: int = 20) -> List[Dict[str
                 include_values=False
             )
             
-            # Collect results with query variant info
+            # Collect results
             for match in search_results.matches:
-                if match.metadata:
+                if match.metadata and match.score > 0.1:  # Early filtering
                     all_results.append({
                         'id': match.id,
                         'score': match.score,
                         'text': match.metadata.get('text', ''),
                         'doc_id': match.metadata.get('doc_id', ''),
                         'chunk_index': match.metadata.get('chunk_index', 0),
-                        'query_variant': i,
-                        'metadata': match.metadata
+                        'query_variant': i
                     })
         
-        # Remove duplicates and sort by score
+        # Quick deduplication and sorting
         seen_ids = set()
         unique_results = []
         for result in sorted(all_results, key=lambda x: x['score'], reverse=True):
-            if result['id'] not in seen_ids:
+            if result['id'] not in seen_ids and len(unique_results) < 12:  # Limit results
                 seen_ids.add(result['id'])
                 unique_results.append(result)
         
-        # Log results for debugging
-        logger.info(f"Found {len(unique_results)} unique matches")
-        for i, result in enumerate(unique_results[:5]):
-            logger.info(f"  Match {i}: ID={result['id']}, Score={result['score']:.4f}, "
-                       f"Query variant={result['query_variant']}")
-            logger.info(f"    Text preview: {result['text'][:100]}...")
-        
+        logger.info(f"Found {len(unique_results)} matches")
         return unique_results
         
     except Exception as e:
-        logger.error(f"Error in advanced search: {e}")
+        logger.error(f"Error in search: {e}")
         return []
 
 def filter_and_rank_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Filter and rank contexts using multiple criteria"""
+    """Streamlined context filtering for speed"""
     if not search_results:
         return []
     
-    # Multiple filtering strategies
     contexts = []
-    
-    # Strategy 1: High similarity score
-    high_score_results = [r for r in search_results if r['score'] > 0.15]
-    logger.info(f"High score results (>0.15): {len(high_score_results)}")
-    
-    # Strategy 2: Keyword matching
     query_words = set(query.lower().split())
-    keyword_results = []
-    for result in search_results[:15]:  # Check top 15
-        text_words = set(result['text'].lower().split())
-        overlap = len(query_words.intersection(text_words))
-        if overlap >= 2 or result['score'] > 0.1:  # At least 2 word overlap or decent score
-            keyword_results.append(result)
     
-    logger.info(f"Keyword matching results: {len(keyword_results)}")
-    
-    # Combine strategies
-    combined_results = high_score_results if high_score_results else keyword_results
-    
-    # If still no results, take top scoring ones anyway
-    if not combined_results and search_results:
-        combined_results = search_results[:5]
-        logger.info("Using fallback: top 5 results regardless of score")
-    
-    # Extract contexts
-    for result in combined_results[:10]:  # Top 10 contexts max
-        if result['text'] and len(result['text'].strip()) > 50:
+    # Single-pass filtering with combined criteria
+    for result in search_results[:10]:  # Only check top 10 for speed
+        if result['score'] > 0.15:  # High confidence
             contexts.append(result['text'])
+        elif result['score'] > 0.1:  # Medium confidence, check keywords
+            text_words = set(result['text'].lower().split())
+            overlap = len(query_words.intersection(text_words))
+            if overlap >= 2:  # At least 2 word overlap
+                contexts.append(result['text'])
+        
+        if len(contexts) >= 5:  # Stop early when we have enough
+            break
     
-    logger.info(f"Final contexts selected: {len(contexts)}")
+    # Fallback if no good contexts found
+    if not contexts and search_results:
+        contexts = [r['text'] for r in search_results[:3]]
+        logger.info("Using fallback contexts")
+    
+    logger.info(f"Selected {len(contexts)} contexts")
     return contexts
 
 def generate_comprehensive_answer(question: str, contexts: List[str]) -> str:
-    """Generate comprehensive answer with improved prompting"""
+    """Generate concise, focused answers quickly"""
     try:
         if not contexts:
             return "I couldn't find relevant information in the indexed documents to answer this question."
         
-        # Prepare context with better formatting
-        numbered_contexts = []
-        for i, context in enumerate(contexts[:7], 1):  # Use up to 7 contexts
-            numbered_contexts.append(f"Context {i}:\n{context}\n")
+        # Use fewer contexts for speed and conciseness
+        selected_contexts = contexts[:4]  # Max 4 contexts instead of 7
+        context_text = "\n\n".join([f"Context {i+1}: {ctx[:500]}" for i, ctx in enumerate(selected_contexts)])
         
-        context_text = "\n".join(numbered_contexts)
+        logger.info(f"Generating answer with {len(selected_contexts)} contexts")
         
-        logger.info(f"Generating answer for: '{question}'")
-        logger.info(f"Using {len(contexts)} contexts, total length: {len(context_text)} chars")
-        
-        # Improved prompt with specific instructions
-        prompt = f"""You are a helpful AI assistant. Based on the provided contexts from documents, answer the user's question comprehensively and accurately.
+        # Optimized prompt for concise answers
+        prompt = f"""Based on the provided contexts, give a direct and concise answer to the question.
 
 CONTEXTS:
 {context_text}
@@ -257,29 +242,26 @@ CONTEXTS:
 QUESTION: {question}
 
 INSTRUCTIONS:
-1. Provide a detailed answer based on the information found in the contexts
-2. If you find relevant information, synthesize it from multiple contexts if needed
-3. Be specific and cite relevant details
-4. If the exact answer isn't available but related information exists, provide that and explain what's missing
-5. Only say you cannot answer if absolutely no relevant information is found
-6. Structure your answer clearly with key points
+- Provide a focused, direct answer (2-4 sentences maximum)
+- Only include the most relevant information
+- Be specific and factual
+- If information is not available, state it clearly and briefly
 
-ANSWER:"""
+CONCISE ANSWER:"""
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={
-                'temperature': 0.3,
-                'top_p': 0.9,
-                'top_k': 40,
-                'max_output_tokens': 2048,
+                'temperature': 0.1,  # Lower temperature for more focused responses
+                'top_p': 0.8,
+                'top_k': 20,
+                'max_output_tokens': 512,  # Reduced from 2048 to 512
             }
         )
         
         answer = response.text.strip()
-        logger.info(f"Generated answer length: {len(answer)} chars")
-        logger.info(f"Answer preview: {answer[:150]}...")
+        logger.info(f"Generated answer: {len(answer)} chars")
         
         return answer
         
@@ -383,32 +365,27 @@ async def process_query(
         # Process each question
         async def process_single_question(question: str) -> str:
             try:
-                logger.info(f"\n--- Processing Question ---")
-                logger.info(f"Question: {question}")
+                logger.info(f"Processing: {question}")
                 
-                # Advanced search
-                search_results = advanced_search_similar_chunks(question, top_k=25)
+                # Optimized search with reduced complexity
+                search_results = advanced_search_similar_chunks(question, top_k=12)
                 
                 if not search_results:
-                    logger.warning("No search results found")
-                    return f"I couldn't find any relevant information for the question: '{question}'"
+                    return f"No relevant information found for: '{question}'"
                 
-                # Filter and rank contexts
+                # Streamlined context filtering
                 contexts = filter_and_rank_contexts(search_results, question)
                 
                 if not contexts:
-                    logger.warning("No contexts passed filtering")
-                    return f"I found some potentially related information, but it doesn't seem relevant enough to answer: '{question}'"
+                    return f"Found potentially related information, but not relevant enough for: '{question}'"
                 
-                # Generate answer
+                # Generate concise answer
                 answer = generate_comprehensive_answer(question, contexts)
-                
-                logger.info(f"Successfully generated answer for: {question}")
                 return answer
                 
             except Exception as e:
-                logger.error(f"Error processing question '{question}': {e}")
-                return f"Error processing the question '{question}': {str(e)}"
+                logger.error(f"Error processing '{question}': {e}")
+                return f"Error processing: {str(e)}"
         
         # Process all questions concurrently
         tasks = [process_single_question(q) for q in request.questions]
@@ -418,9 +395,7 @@ async def process_query(
         gc.collect()
         
         processing_time = time.time() - start_time
-        logger.info(f"\n=== PROCESSING COMPLETE ===")
-        logger.info(f"Total time: {processing_time:.2f}s")
-        logger.info(f"Questions processed: {len(request.questions)}")
+        logger.info(f"Processed {len(request.questions)} questions in {processing_time:.2f}s")
         
         return QueryResponse(answers=answers)
         
