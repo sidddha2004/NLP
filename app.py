@@ -6,6 +6,7 @@ import time
 import gc
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -28,8 +29,8 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI(
     title="Railway Semantic Search API", 
-    version="2.0.0",
-    debug=True,
+    version="2.1.0",
+    debug=False,  # Disable debug mode for production
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -56,6 +57,7 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 embedding_model = None
 pinecone_client = None
 pc_index = None
+executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for CPU-bound tasks
 
 class QueryRequest(BaseModel):
     document_url: Optional[HttpUrl] = None
@@ -91,6 +93,8 @@ def initialize_models():
         # Initialize embedding model with exact same settings as Phase 1
         logger.info("Loading paraphrase-MiniLM-L6-v2 model...")
         embedding_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
+        # Set to use CPU for consistent performance
+        embedding_model = embedding_model.to('cpu')
         logger.info("Embedding model loaded successfully")
         
         if not PINECONE_API_KEY:
@@ -111,158 +115,129 @@ def preprocess_query(query: str) -> str:
     query = query.strip()
     return query
 
-def expand_query(query: str) -> List[str]:
-    """Create query variations for better matching"""
-    variations = [query]
+# Async wrapper for embedding generation
+async def generate_embedding_async(text: str) -> List[float]:
+    """Generate embedding asynchronously using thread pool"""
+    loop = asyncio.get_event_loop()
     
-    # Add simplified version
-    simple_query = re.sub(r'[^\w\s]', ' ', query.lower())
-    simple_query = re.sub(r'\s+', ' ', simple_query).strip()
-    if simple_query != query.lower():
-        variations.append(simple_query)
+    def _generate_embedding():
+        return embedding_model.encode(
+            [text], 
+            convert_to_tensor=False,
+            normalize_embeddings=True,
+            show_progress_bar=False  # Disable progress bar for speed
+        )[0].tolist()
     
-    # Add key terms only
-    words = simple_query.split()
-    if len(words) > 3:
-        key_terms = ' '.join(words[:3])  # First 3 words
-        variations.append(key_terms)
-    
-    return list(set(variations))  # Remove duplicates
+    return await loop.run_in_executor(executor, _generate_embedding)
 
-def advanced_search_similar_chunks(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
-    """Optimized search with reduced complexity for speed"""
+async def fast_search_similar_chunks(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
+    """Optimized search with minimal variations and async operations"""
     try:
         logger.info(f"Searching for: '{query}'")
         
         # Preprocess query
         processed_query = preprocess_query(query)
         
-        # Reduced to max 2 variations for speed
-        query_variations = [processed_query]
+        # Generate embedding asynchronously
+        query_embedding = await generate_embedding_async(processed_query)
         
-        # Add only one simplified variation if query is complex
-        simple_query = re.sub(r'[^\w\s]', ' ', processed_query.lower())
-        simple_query = re.sub(r'\s+', ' ', simple_query).strip()
-        if simple_query != processed_query.lower() and len(processed_query.split()) > 2:
-            query_variations.append(simple_query)
+        # Single Pinecone search with optimized parameters
+        search_results = pc_index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True,
+            include_values=False
+        )
         
-        all_results = []
+        # Process results quickly
+        results = []
+        for match in search_results.matches:
+            if match.metadata and match.score > 0.1:  # Early filtering
+                results.append({
+                    'id': match.id,
+                    'score': match.score,
+                    'text': match.metadata.get('text', ''),
+                    'doc_id': match.metadata.get('doc_id', ''),
+                    'chunk_index': match.metadata.get('chunk_index', 0)
+                })
         
-        # Search with fewer variations
-        for i, query_var in enumerate(query_variations):
-            # Generate embedding
-            query_embedding = embedding_model.encode(
-                [query_var], 
-                convert_to_tensor=False,
-                normalize_embeddings=True
-            )[0].tolist()
-            
-            # Single Pinecone search with higher top_k to get good results in one go
-            search_results = pc_index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-                include_values=False
-            )
-            
-            # Collect results
-            for match in search_results.matches:
-                if match.metadata and match.score > 0.1:  # Early filtering
-                    all_results.append({
-                        'id': match.id,
-                        'score': match.score,
-                        'text': match.metadata.get('text', ''),
-                        'doc_id': match.metadata.get('doc_id', ''),
-                        'chunk_index': match.metadata.get('chunk_index', 0),
-                        'query_variant': i
-                    })
-        
-        # Quick deduplication and sorting
-        seen_ids = set()
-        unique_results = []
-        for result in sorted(all_results, key=lambda x: x['score'], reverse=True):
-            if result['id'] not in seen_ids and len(unique_results) < 12:  # Limit results
-                seen_ids.add(result['id'])
-                unique_results.append(result)
-        
-        logger.info(f"Found {len(unique_results)} matches")
-        return unique_results
+        logger.info(f"Found {len(results)} matches")
+        return results
         
     except Exception as e:
         logger.error(f"Error in search: {e}")
         return []
 
-def filter_and_rank_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Streamlined context filtering for speed"""
+def quick_filter_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
+    """Fast context filtering with simplified logic"""
     if not search_results:
         return []
     
     contexts = []
-    query_words = set(query.lower().split())
+    query_lower = query.lower()
     
-    # Single-pass filtering with combined criteria
-    for result in search_results[:10]:  # Only check top 10 for speed
-        if result['score'] > 0.15:  # High confidence
+    # Simple scoring and filtering
+    for result in search_results[:6]:  # Only check top 6 for speed
+        if result['score'] > 0.2:  # High confidence threshold
             contexts.append(result['text'])
-        elif result['score'] > 0.1:  # Medium confidence, check keywords
-            text_words = set(result['text'].lower().split())
-            overlap = len(query_words.intersection(text_words))
-            if overlap >= 2:  # At least 2 word overlap
+        elif result['score'] > 0.15:  # Medium confidence, quick keyword check
+            if any(word in result['text'].lower() for word in query_lower.split()[:3]):
                 contexts.append(result['text'])
         
-        if len(contexts) >= 5:  # Stop early when we have enough
+        if len(contexts) >= 4:  # Limit contexts for speed
             break
     
-    # Fallback if no good contexts found
+    # Fallback if no contexts found
     if not contexts and search_results:
-        contexts = [r['text'] for r in search_results[:3]]
-        logger.info("Using fallback contexts")
+        contexts = [search_results[0]['text']]  # At least one context
+        logger.info("Using fallback context")
     
     logger.info(f"Selected {len(contexts)} contexts")
     return contexts
 
-def generate_comprehensive_answer(question: str, contexts: List[str]) -> str:
-    """Generate concise, focused answers quickly"""
+async def generate_fast_answer(question: str, contexts: List[str]) -> str:
+    """Generate answers with optimized Gemini settings"""
     try:
         if not contexts:
             return "I couldn't find relevant information in the indexed documents to answer this question."
         
-        # Use fewer contexts for speed and conciseness
-        selected_contexts = contexts[:4]  # Max 4 contexts instead of 7
-        context_text = "\n\n".join([f"Context {i+1}: {ctx[:500]}" for i, ctx in enumerate(selected_contexts)])
+        # Use only top 3 contexts and limit their length
+        selected_contexts = contexts[:3]
+        context_text = "\n\n".join([f"Context {i+1}: {ctx[:300]}" for i, ctx in enumerate(selected_contexts)])
         
         logger.info(f"Generating answer with {len(selected_contexts)} contexts")
         
-        # Optimized prompt for concise answers
-        prompt = f"""Based on the provided contexts, give a direct and concise answer to the question.
+        # Optimized prompt for speed and conciseness
+        prompt = f"""Answer the question directly and concisely based on the provided contexts.
 
 CONTEXTS:
 {context_text}
 
 QUESTION: {question}
 
-INSTRUCTIONS:
-- Provide a focused, direct answer (2-4 sentences maximum)
-- Only include the most relevant information
-- Be specific and factual
-- If information is not available, state it clearly and briefly
+Provide a direct answer in 2-3 sentences maximum. Be specific and factual.
 
-CONCISE ANSWER:"""
+ANSWER:"""
 
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                'temperature': 0.1,  # Lower temperature for more focused responses
-                'top_p': 0.8,
-                'top_k': 20,
-                'max_output_tokens': 512,  # Reduced from 2048 to 512
-            }
-        )
+        # Run Gemini API call in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
         
-        answer = response.text.strip()
+        def _generate_content():
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            response = model.generate_content(
+                prompt,
+                generation_config={
+                    'temperature': 0.1,
+                    'top_p': 0.8,
+                    'top_k': 20,
+                    'max_output_tokens': 256,  # Further reduced for speed
+                }
+            )
+            return response.text.strip()
+        
+        answer = await loop.run_in_executor(executor, _generate_content)
+        
         logger.info(f"Generated answer: {len(answer)} chars")
-        
         return answer
         
     except Exception as e:
@@ -295,24 +270,22 @@ async def debug_search_endpoint(
     request: SearchDebugRequest,
     token: str = Depends(verify_token)
 ):
-    """Enhanced debug endpoint for search testing"""
+    """Debug endpoint for search testing"""
     try:
         # Get search results
-        search_results = advanced_search_similar_chunks(request.query, request.top_k)
+        search_results = await fast_search_similar_chunks(request.query, request.top_k)
         
         # Get index stats
         index_stats = pc_index.describe_index_stats()
         
         # Process contexts
-        contexts = filter_and_rank_contexts(search_results, request.query)
+        contexts = quick_filter_contexts(search_results, request.query)
         
         return {
             "query": request.query,
-            "query_variations": expand_query(preprocess_query(request.query)),
             "index_stats": {
                 "total_vectors": index_stats.total_vector_count,
-                "dimension": index_stats.dimension,
-                "namespaces": index_stats.namespaces
+                "dimension": index_stats.dimension
             },
             "search_results": {
                 "total_matches": len(search_results),
@@ -321,14 +294,14 @@ async def debug_search_endpoint(
                         "id": r['id'],
                         "score": r['score'],
                         "doc_id": r['doc_id'],
-                        "text_preview": r['text'][:200] + "..." if len(r['text']) > 200 else r['text']
+                        "text_preview": r['text'][:150] + "..." if len(r['text']) > 150 else r['text']
                     }
-                    for r in search_results[:5]
+                    for r in search_results[:3]
                 ]
             },
             "filtered_contexts": {
                 "count": len(contexts),
-                "contexts": [ctx[:300] + "..." if len(ctx) > 300 else ctx for ctx in contexts[:3]]
+                "contexts": [ctx[:200] + "..." if len(ctx) > 200 else ctx for ctx in contexts[:2]]
             }
         }
     except Exception as e:
@@ -340,11 +313,11 @@ async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """Main endpoint for processing queries - ENHANCED VERSION"""
+    """Main endpoint for processing queries - SPEED OPTIMIZED VERSION"""
     try:
         start_time = time.time()
         
-        # Check index status first
+        # Quick index check
         index_stats = pc_index.describe_index_stats()
         total_vectors = index_stats.total_vector_count
         
@@ -356,46 +329,52 @@ async def process_query(
                 answers=["The document index is empty. Please index some documents first."] * len(request.questions)
             )
         
-        # Handle document URL if provided
-        if request.document_url:
-            logger.info(f"Document URL provided: {request.document_url}")
-            # Add document processing logic here if needed
-            # For now, we'll search the existing index
-        
-        # Process each question
+        # Process each question with optimized pipeline
         async def process_single_question(question: str) -> str:
             try:
+                question_start = time.time()
                 logger.info(f"Processing: {question}")
                 
-                # Optimized search with reduced complexity
-                search_results = advanced_search_similar_chunks(question, top_k=12)
+                # Fast search with reduced results
+                search_results = await fast_search_similar_chunks(question, top_k=6)
                 
                 if not search_results:
                     return f"No relevant information found for: '{question}'"
                 
-                # Streamlined context filtering
-                contexts = filter_and_rank_contexts(search_results, question)
+                # Quick context filtering
+                contexts = quick_filter_contexts(search_results, question)
                 
                 if not contexts:
                     return f"Found potentially related information, but not relevant enough for: '{question}'"
                 
-                # Generate concise answer
-                answer = generate_comprehensive_answer(question, contexts)
+                # Generate fast answer
+                answer = await generate_fast_answer(question, contexts)
+                
+                question_time = time.time() - question_start
+                logger.info(f"Question processed in {question_time:.2f}s")
+                
                 return answer
                 
             except Exception as e:
                 logger.error(f"Error processing '{question}': {e}")
                 return f"Error processing: {str(e)}"
         
-        # Process all questions concurrently
-        tasks = [process_single_question(q) for q in request.questions]
+        # Process questions with controlled concurrency
+        semaphore = asyncio.Semaphore(3)  # Limit concurrent processing
+        
+        async def process_with_semaphore(question: str) -> str:
+            async with semaphore:
+                return await process_single_question(question)
+        
+        # Process all questions
+        tasks = [process_with_semaphore(q) for q in request.questions]
         answers = await asyncio.gather(*tasks)
         
-        # Clean up
+        # Quick cleanup
         gc.collect()
         
         processing_time = time.time() - start_time
-        logger.info(f"Processed {len(request.questions)} questions in {processing_time:.2f}s")
+        logger.info(f"TOTAL: Processed {len(request.questions)} questions in {processing_time:.2f}s")
         
         return QueryResponse(answers=answers)
         
@@ -415,21 +394,15 @@ async def process_query_api(
 async def root():
     """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API - Enhanced Version",
-        "version": "2.0.0",
+        "message": "Railway Semantic Search API - Speed Optimized Version",
+        "version": "2.1.0",
         "status": "active",
-        "endpoints": [
-            "GET /",
-            "GET /health",
-            "POST /debug-search",
-            "POST /hackrx/run",
-            "POST /api/hackrx/run"
-        ]
+        "optimizations": "Async processing, reduced contexts, faster filtering"
     }
 
 @app.get("/debug")
 async def debug_info():
-    """Enhanced debug endpoint"""
+    """Debug endpoint"""
     try:
         index_stats = pc_index.describe_index_stats()
         
@@ -438,7 +411,7 @@ async def debug_info():
         
         return {
             "app_status": "running",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "models": {
                 "embedding_loaded": embedding_model is not None,
                 "embedding_dimension": len(test_embedding),
@@ -446,8 +419,7 @@ async def debug_info():
             },
             "index_stats": {
                 "total_vectors": index_stats.total_vector_count,
-                "dimension": index_stats.dimension,
-                "namespaces": index_stats.namespaces
+                "dimension": index_stats.dimension
             },
             "config": {
                 "API_BEARER_TOKEN": "SET" if API_BEARER_TOKEN else "MISSING",
@@ -457,6 +429,11 @@ async def debug_info():
         }
     except Exception as e:
         return {"error": str(e), "app_status": "error"}
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     import uvicorn
