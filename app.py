@@ -381,7 +381,7 @@ ANSWER:"""
         loop = asyncio.get_event_loop()
         
         def _generate_content():
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
             response = model.generate_content(
                 prompt,
                 generation_config={
