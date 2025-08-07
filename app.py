@@ -549,7 +549,8 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
-)import os
+)
+import os
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional, Tuple
