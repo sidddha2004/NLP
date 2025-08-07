@@ -509,7 +509,33 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
 '''
+import os
+import asyncio
+import logging
+from typing import List, Dict, Any, Optional, Tuple
+import time
+import gc
+import re
+from collections import defaultdict
+from functools import lru_cache
+import hashlib
+import json
 from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Depends, status, Request, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+import requests
+import PyPDF2
+from io import BytesIO
+from sentence_transformers import SentenceTransformer
+import pinecone
+import google.generativeai as genai
+from pinecone import Pinecone
+import numpy as np
+import tiktoken
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Create lifespan context manager for FastAPI
 @asynccontextmanager
@@ -550,33 +576,6 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan
 )
-import os
-import asyncio
-import logging
-from typing import List, Dict, Any, Optional, Tuple
-import time
-import gc
-import re
-from collections import defaultdict
-from functools import lru_cache
-import hashlib
-import json
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException, Depends, status, Request, BackgroundTasks
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-import requests
-import PyPDF2
-from io import BytesIO
-from sentence_transformers import SentenceTransformer
-import pinecone
-import google.generativeai as genai
-from pinecone import Pinecone
-import numpy as np
-import tiktoken
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
