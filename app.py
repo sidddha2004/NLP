@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI(
     title="Railway Semantic Search API", 
-    version="2.1.0",
+    version="2.2.0",
     debug=False,  # Disable debug mode for production
     docs_url="/docs",
     redoc_url="/redoc"
@@ -130,69 +130,128 @@ async def generate_embedding_async(text: str) -> List[float]:
     
     return await loop.run_in_executor(executor, _generate_embedding)
 
-async def fast_search_similar_chunks(query: str, top_k: int = 8) -> List[Dict[str, Any]]:
-    """Optimized search with minimal variations and async operations"""
+async def fast_search_similar_chunks(query: str, top_k: int = 12) -> List[Dict[str, Any]]:
+    """Optimized search with better accuracy and minimal variations"""
     try:
         logger.info(f"Searching for: '{query}'")
         
         # Preprocess query
         processed_query = preprocess_query(query)
         
-        # Generate embedding asynchronously
-        query_embedding = await generate_embedding_async(processed_query)
+        # Generate two query variants for better recall
+        query_variants = [processed_query]
         
-        # Single Pinecone search with optimized parameters
-        search_results = pc_index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            include_values=False
-        )
+        # Add a simplified variant for better matching
+        simple_query = re.sub(r'[^\w\s]', ' ', processed_query.lower())
+        simple_query = re.sub(r'\s+', ' ', simple_query).strip()
+        if simple_query != processed_query.lower() and len(processed_query.split()) > 2:
+            query_variants.append(simple_query)
         
-        # Process results quickly
-        results = []
-        for match in search_results.matches:
-            if match.metadata and match.score > 0.1:  # Early filtering
-                results.append({
-                    'id': match.id,
-                    'score': match.score,
-                    'text': match.metadata.get('text', ''),
-                    'doc_id': match.metadata.get('doc_id', ''),
-                    'chunk_index': match.metadata.get('chunk_index', 0)
-                })
+        all_results = []
         
-        logger.info(f"Found {len(results)} matches")
-        return results
+        # Search with both variants but process efficiently
+        for i, query_var in enumerate(query_variants):
+            # Generate embedding asynchronously
+            query_embedding = await generate_embedding_async(query_var)
+            
+            # Pinecone search with optimized parameters
+            search_results = pc_index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True,
+                include_values=False
+            )
+            
+            # Process results quickly
+            for match in search_results.matches:
+                if match.metadata and match.score > 0.08:  # Lower threshold for better recall
+                    all_results.append({
+                        'id': match.id,
+                        'score': match.score,
+                        'text': match.metadata.get('text', ''),
+                        'doc_id': match.metadata.get('doc_id', ''),
+                        'chunk_index': match.metadata.get('chunk_index', 0),
+                        'query_variant': i
+                    })
+        
+        # Quick deduplication while preserving best scores
+        seen_ids = {}
+        for result in all_results:
+            if result['id'] not in seen_ids or result['score'] > seen_ids[result['id']]['score']:
+                seen_ids[result['id']] = result
+        
+        # Sort by score and return top results
+        unique_results = sorted(seen_ids.values(), key=lambda x: x['score'], reverse=True)[:top_k]
+        
+        logger.info(f"Found {len(unique_results)} unique matches")
+        return unique_results
         
     except Exception as e:
         logger.error(f"Error in search: {e}")
         return []
 
-def quick_filter_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Fast context filtering with simplified logic"""
+def smart_filter_contexts(search_results: List[Dict[str, Any]], query: str) -> List[str]:
+    """Enhanced context filtering with better accuracy"""
     if not search_results:
         return []
     
     contexts = []
     query_lower = query.lower()
+    query_words = set(query_lower.split())
     
-    # Simple scoring and filtering
-    for result in search_results[:6]:  # Only check top 6 for speed
-        if result['score'] > 0.2:  # High confidence threshold
-            contexts.append(result['text'])
-        elif result['score'] > 0.15:  # Medium confidence, quick keyword check
-            if any(word in result['text'].lower() for word in query_lower.split()[:3]):
-                contexts.append(result['text'])
+    # Score contexts based on multiple criteria
+    scored_contexts = []
+    
+    for result in search_results[:8]:  # Check more results for better accuracy
+        score = result['score']
+        text = result['text']
+        text_lower = text.lower()
+        text_words = set(text_lower.split())
         
-        if len(contexts) >= 4:  # Limit contexts for speed
+        # Calculate enhanced relevance score
+        relevance_score = score
+        
+        # Boost score for exact phrase matches
+        if query_lower in text_lower:
+            relevance_score += 0.1
+        
+        # Boost score for keyword overlap
+        word_overlap = len(query_words.intersection(text_words))
+        if len(query_words) > 0:
+            overlap_ratio = word_overlap / len(query_words)
+            relevance_score += overlap_ratio * 0.05
+        
+        # Boost score for important keywords (domain-specific terms)
+        important_keywords = ['railway', 'train', 'station', 'track', 'signal', 'safety', 'maintenance', 'schedule']
+        for keyword in important_keywords:
+            if keyword in text_lower and keyword in query_lower:
+                relevance_score += 0.02
+        
+        scored_contexts.append({
+            'text': text,
+            'relevance_score': relevance_score,
+            'original_score': score
+        })
+    
+    # Sort by enhanced relevance score
+    scored_contexts.sort(key=lambda x: x['relevance_score'], reverse=True)
+    
+    # Select contexts with adaptive thresholds
+    for ctx in scored_contexts:
+        if len(contexts) >= 5:  # Limit to 5 contexts for balance
             break
+            
+        if ctx['relevance_score'] > 0.15:  # High relevance
+            contexts.append(ctx['text'])
+        elif ctx['relevance_score'] > 0.12 and len(contexts) < 3:  # Medium relevance, ensure minimum contexts
+            contexts.append(ctx['text'])
     
-    # Fallback if no contexts found
-    if not contexts and search_results:
-        contexts = [search_results[0]['text']]  # At least one context
-        logger.info("Using fallback context")
+    # Ensure we have at least one context if results exist
+    if not contexts and scored_contexts:
+        contexts = [scored_contexts[0]['text']]
+        logger.info("Using fallback context with highest score")
     
-    logger.info(f"Selected {len(contexts)} contexts")
+    logger.info(f"Selected {len(contexts)} contexts with enhanced filtering")
     return contexts
 
 async def generate_fast_answer(question: str, contexts: List[str]) -> str:
@@ -223,7 +282,7 @@ ANSWER:"""
         loop = asyncio.get_event_loop()
         
         def _generate_content():
-            model = genai.GenerativeModel('gemini-2.5-flash-lite')
+            model = genai.GenerativeModel('gemini-2.0-flash')
             response = model.generate_content(
                 prompt,
                 generation_config={
@@ -279,7 +338,7 @@ async def debug_search_endpoint(
         index_stats = pc_index.describe_index_stats()
         
         # Process contexts
-        contexts = quick_filter_contexts(search_results, request.query)
+        contexts = smart_filter_contexts(search_results, request.query)
         
         return {
             "query": request.query,
@@ -335,20 +394,20 @@ async def process_query(
                 question_start = time.time()
                 logger.info(f"Processing: {question}")
                 
-                # Fast search with reduced results
-                search_results = await fast_search_similar_chunks(question, top_k=6)
+                # Fast search with better coverage
+                search_results = await fast_search_similar_chunks(question, top_k=8)
                 
                 if not search_results:
                     return f"No relevant information found for: '{question}'"
                 
-                # Quick context filtering
-                contexts = quick_filter_contexts(search_results, question)
+                # Enhanced context filtering
+                contexts = smart_filter_contexts(search_results, question)
                 
                 if not contexts:
                     return f"Found potentially related information, but not relevant enough for: '{question}'"
                 
-                # Generate fast answer
-                answer = await generate_fast_answer(question, contexts)
+                # Generate enhanced answer
+                answer = await generate_enhanced_answer(question, contexts)
                 
                 question_time = time.time() - question_start
                 logger.info(f"Question processed in {question_time:.2f}s")
@@ -394,10 +453,10 @@ async def process_query_api(
 async def root():
     """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API - Speed Optimized Version",
-        "version": "2.1.0",
+        "message": "Railway Semantic Search API - Speed + Accuracy Optimized",
+        "version": "2.2.0",
         "status": "active",
-        "optimizations": "Async processing, reduced contexts, faster filtering"
+        "optimizations": "Async processing, enhanced context filtering, better search coverage"
     }
 
 @app.get("/debug")
@@ -411,7 +470,7 @@ async def debug_info():
         
         return {
             "app_status": "running",
-            "version": "2.1.0",
+            "version": "2.2.0",
             "models": {
                 "embedding_loaded": embedding_model is not None,
                 "embedding_dimension": len(test_embedding),
