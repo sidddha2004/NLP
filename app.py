@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Any, Optional
 import time
 import gc
+import hashlib
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -202,28 +203,47 @@ def store_embeddings_in_pinecone(chunks: List[str], embeddings: List[List[float]
         logger.error(f"Error storing embeddings: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store embeddings: {str(e)}")
 
-def search_similar_chunks(query: str, top_k: int = 10) -> List[str]:
-    """Search for similar chunks in Pinecone"""
+def search_similar_chunks(query: str, top_k: int = 15) -> List[str]:
+    """Search for similar chunks in Pinecone - FIXED VERSION"""
     try:
+        logger.info(f"Searching for query: '{query}'")
+        
+        # Generate query embedding using the SAME model as indexing
         query_embedding = embedding_model.encode([query], convert_to_tensor=False)[0].tolist()
         
+        # Search in Pinecone
         search_results = pc_index.query(
             vector=query_embedding,
             top_k=top_k,
-            include_metadata=True
+            include_metadata=True,
+            include_values=False  # Don't need the vectors back
         )
         
-        logger.info(f"Search for '{query}' returned {len(search_results.matches)} matches")
+        logger.info(f"Pinecone returned {len(search_results.matches)} matches")
         
+        # Log all results for debugging
         contexts = []
         for i, match in enumerate(search_results.matches):
-            logger.info(f"Match {i}: score={match.score:.3f}")
-            # Lower the threshold to get more results
-            if match.score > 0.3:  # Reduced from 0.5 to 0.3
-                contexts.append(match.metadata.get('text', ''))
-                logger.info(f"Added context: {match.metadata.get('text', '')[:100]}...")
+            score = match.score
+            text = match.metadata.get('text', '') if match.metadata else ''
+            logger.info(f"Match {i}: ID={match.id}, Score={score:.4f}, Text preview: {text[:100]}...")
+            
+            # SIGNIFICANTLY lowered threshold - was 0.3, now 0.1
+            if score > 0.1:
+                contexts.append(text)
+                logger.info(f"✓ Added context {i} with score {score:.4f}")
+            else:
+                logger.info(f"✗ Rejected context {i} with score {score:.4f} (below 0.1 threshold)")
         
-        logger.info(f"Returning {len(contexts)} contexts")
+        if not contexts:
+            logger.warning("No contexts found above threshold!")
+            # If no good matches, take the top 3 anyway for debugging
+            for match in search_results.matches[:3]:
+                if match.metadata and match.metadata.get('text'):
+                    contexts.append(match.metadata['text'])
+                    logger.info(f"Added fallback context with score {match.score:.4f}")
+        
+        logger.info(f"Returning {len(contexts)} contexts total")
         return contexts
         
     except Exception as e:
@@ -231,31 +251,37 @@ def search_similar_chunks(query: str, top_k: int = 10) -> List[str]:
         return []
 
 def generate_answer_with_gemini(question: str, contexts: List[str]) -> str:
-    """Generate answer using Gemini 1.5 Flash"""
+    """Generate answer using Gemini 1.5 Flash - IMPROVED VERSION"""
     try:
-        context_text = "\n\n".join(contexts[:3])  # Use top 3 contexts
+        # Use more contexts for better answers
+        context_text = "\n\n".join(contexts[:5])  # Use top 5 contexts instead of 3
         
-        prompt = f"""Based on the following context, provide a precise and accurate answer to the question. If the answer cannot be found in the context, say "I cannot find this information in the provided document."
+        logger.info(f"Generating answer for: {question}")
+        logger.info(f"Using {len(contexts)} contexts, total length: {len(context_text)} chars")
+        
+        prompt = f"""Based on the following context from documents, provide a comprehensive and accurate answer to the question. If you cannot find the specific information in the context, try to provide related information that might be helpful, and clearly state what information is missing.
 
 Context:
 {context_text}
 
 Question: {question}
 
-Answer:"""
+Answer (be specific and detailed):"""
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(
             prompt,
             generation_config={
-                'temperature': 0.1,
-                'top_p': 0.8,
+                'temperature': 0.2,  # Slightly higher for more natural responses
+                'top_p': 0.9,
                 'top_k': 40,
                 'max_output_tokens': 1024,
             }
         )
         
-        return response.text.strip()
+        answer = response.text.strip()
+        logger.info(f"Generated answer: {answer[:100]}...")
+        return answer
         
     except Exception as e:
         logger.error(f"Error generating answer with Gemini: {e}")
@@ -288,6 +314,25 @@ async def test_endpoint():
     """Simple test endpoint - no auth required"""
     return {"message": "API is working!", "timestamp": time.time()}
 
+# NEW DEBUG ENDPOINT
+@app.post("/test-search")
+async def test_search_endpoint(
+    query: str,
+    token: str = Depends(verify_token)
+):
+    """Debug endpoint to test search functionality"""
+    try:
+        contexts = search_similar_chunks(query, top_k=10)
+        return {
+            "query": query,
+            "contexts_found": len(contexts),
+            "contexts": contexts[:3],  # Return first 3 for inspection
+            "index_stats": pc_index.describe_index_stats()
+        }
+    except Exception as e:
+        logger.error(f"Error in test search: {e}")
+        return {"error": str(e)}
+
 @app.post("/api/hackrx/run", response_model=QueryResponse)
 async def process_query_api(
     request: QueryRequest,
@@ -305,7 +350,7 @@ async def process_query(
     return await process_query_logic(request)
 
 async def process_query_logic(request: QueryRequest):
-    """Shared logic for processing queries"""
+    """Shared logic for processing queries - IMPROVED VERSION"""
     try:
         start_time = time.time()
         
@@ -315,9 +360,12 @@ async def process_query_logic(request: QueryRequest):
             logger.info(f"Processing document: {request.document_url}")
             pdf_text = extract_text_from_pdf(str(request.document_url))
             
+            if not pdf_text.strip():
+                raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
+            
             # Chunk the text
             chunks = chunk_text(pdf_text)
-            logger.info(f"Created {len(chunks)} chunks")
+            logger.info(f"Created {len(chunks)} chunks from {len(pdf_text)} characters")
             
             # Generate embeddings
             embeddings = generate_embeddings(chunks)
@@ -329,14 +377,26 @@ async def process_query_logic(request: QueryRequest):
         else:
             logger.info("No document URL provided, searching existing index")
         
+        # Check if index has data
+        index_stats = pc_index.describe_index_stats()
+        total_vectors = index_stats.total_vector_count
+        logger.info(f"Pinecone index has {total_vectors} total vectors")
+        
+        if total_vectors == 0:
+            logger.warning("Pinecone index is empty!")
+            return QueryResponse(answers=["The document index is empty. Please index some documents first."] * len(request.questions))
+        
         # Process questions in parallel
         async def process_question(question: str) -> str:
             try:
-                # Search for relevant contexts (from existing index or newly added document)
-                contexts = search_similar_chunks(question)
+                logger.info(f"Processing question: {question}")
+                
+                # Search for relevant contexts
+                contexts = search_similar_chunks(question, top_k=15)
                 
                 if not contexts:
-                    return "No relevant information found in the indexed documents."
+                    logger.warning(f"No contexts found for question: {question}")
+                    return "I couldn't find relevant information in the indexed documents for this question."
                 
                 # Generate answer
                 answer_text = generate_answer_with_gemini(question, contexts)
@@ -372,21 +432,29 @@ async def root():
         "available_endpoints": [
             "GET /",
             "GET /health",
+            "GET /debug",
+            "POST /test-search",
+            "POST /hackrx/run",
             "POST /api/hackrx/run"
         ]
     }
 
 @app.get("/debug")
 async def debug_info():
-    """Debug endpoint to check app status"""
+    """Debug endpoint to check app status - ENHANCED"""
     try:
         # Check Pinecone index stats
         index_stats = pc_index.describe_index_stats()
+        
+        # Test embedding generation
+        test_embedding = embedding_model.encode(["test query"], convert_to_tensor=False)[0]
         
         return {
             "app_status": "running",
             "models_loaded": embedding_model is not None,
             "pinecone_connected": pc_index is not None,
+            "embedding_model_working": len(test_embedding) > 0,
+            "embedding_dimension": len(test_embedding),
             "pinecone_stats": {
                 "total_vectors": index_stats.total_vector_count,
                 "namespaces": index_stats.namespaces,
@@ -422,6 +490,7 @@ async def catch_all(path: str, request: Request):
             "GET /test",
             "GET /debug",
             "GET /docs",
+            "POST /test-search",
             "POST /hackrx/run",
             "POST /api/hackrx/run"
         ],
