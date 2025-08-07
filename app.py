@@ -323,10 +323,31 @@ async def root():
     return {
         "message": "Railway Semantic Search API",
         "version": "1.0.0",
-        "status": "active"
+        "status": "active",
+        "available_endpoints": [
+            "GET /",
+            "GET /health",
+            "POST /api/hackrx/run"
+        ]
+    }
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check app status"""
+    return {
+        "app_status": "running",
+        "models_loaded": embedding_model is not None,
+        "pinecone_connected": pc_index is not None,
+        "environment_vars": {
+            "API_BEARER_TOKEN": "***" if API_BEARER_TOKEN else "MISSING",
+            "GEMINI_API_KEY": "***" if GEMINI_API_KEY else "MISSING",
+            "PINECONE_API_KEY": "***" if PINECONE_API_KEY else "MISSING",
+            "PORT": os.getenv("PORT", "8000")
+        }
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
