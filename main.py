@@ -1,331 +1,332 @@
 import os
-import time
-import logging
 import asyncio
-import re
+import logging
 from typing import List, Dict, Any
+import time
+import gc
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
+from pydantic import BaseModel, HttpUrl
+import requests
 import PyPDF2
-from pinecone import Pinecone, ServerlessSpec
-import google.generativeai as genai
+from io import BytesIO
 from sentence_transformers import SentenceTransformer
+import pinecone
+import google.generativeai as genai
+from pinecone import Pinecone
+import numpy as np
+import tiktoken
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Globals
-gemini_model = None
-pc = None
-index = None
-index_name = "ultra-opt-policy"  # Global index name consistent across the app
-embedding_model = None
-status = {"ready": False, "error": None}
+# Initialize FastAPI app
+app = FastAPI(title="Railway Semantic Search API", version="1.0.0")
 
-
-# FastAPI app with CORS middleware
-app = FastAPI(title="Ultra-Optimized Insurance RAG API", version="1.0")
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-def initialize_services():
-    """Initialize embedding model, Gemini LLM, Pinecone client and index"""
-    global gemini_model, pc, index, embedding_model, status
-
-    try:
-        # Initialize sentence-transformers embedding model (384-dimensional)
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        logger.info("✅ Embedding model (all-MiniLM-L6-v2) initialized.")
-
-        # Initialize Gemini model for generation (not embedding)
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        gemini_model = genai.GenerativeModel(
-            'gemini-1.5-flash',
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=1200,
-            )
-        )
-        logger.info("✅ Gemini 1.5 Flash model initialized.")
-
-        # Initialize Pinecone client
-        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-        logger.info("✅ Pinecone client connected.")
-
-        # Create Pinecone index if it does not exist
-        if index_name not in [idx.name for idx in pc.list_indexes()]:
-            pc.create_index(
-                name=index_name,
-                dimension=384,
-                metric="cosine",
-                spec=ServerlessSpec(cloud="aws", region="us-east-1")
-            )
-            logger.info(f"Created Pinecone index '{index_name}'. Waiting 15 seconds for readiness...")
-            time.sleep(15)  # wait for the index to be ready
-
-        index = pc.Index(index_name)
-        logger.info(f"✅ Pinecone index '{index_name}' ready.")
-
-        status["ready"] = True
-
-    except Exception as e:
-        status["error"] = str(e)
-        logger.error(f"Service initialization failed: {e}")
-        raise e
-
-
-def extract_pdf_text(pdf_path: str) -> str:
-    """Extract text from PDF file"""
-    with open(pdf_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-
-
-def optimal_chunk_text(text: str, size=900, overlap=100) -> List[str]:
-    """Chunk text smartly while preserving sentence boundaries and overlap"""
-    text = re.sub(r'\s+', ' ', text.strip())
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= size:
-            current_chunk += sentence + " "
-        else:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-
-    if len(chunks) > 1 and overlap > 0:
-        overlapped = [chunks[0]]
-        for i in range(1, len(chunks)):
-            prev_words = chunks[i - 1].split()[-overlap // 15 :]
-            overlapped.append(" ".join(prev_words) + " " + chunks[i])
-        chunks = overlapped
-
-    return chunks
-
-
-def get_high_quality_embedding(text: str) -> List[float]:
-    """Embed a given text using sentence-transformers model"""
-    try:
-        embedding = embedding_model.encode(text, convert_to_tensor=False)
-        return embedding.tolist()
-    except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
-        # Optional: fallback or return zero vector
-        return [0.0] * 384
-
-
-def query_relevant_chunks(question: str, top_k=3) -> List[Dict[str, Any]]:
-    """Query Pinecone index for most relevant document chunks"""
-    try:
-        query_embedding = get_high_quality_embedding(question)
-        results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
-        matches = results.matches
-        if not matches:
-            return []
-
-        max_score = max(m.score for m in matches) if matches else 0.0
-        threshold = 0.75 if max_score > 0.85 else 0.60
-
-        relevant = [
-            {
-                "text": match.metadata.get("text", ""),
-                "score": match.score,
-                "id": match.id,
-            }
-            for match in matches if match.score > threshold
-        ]
-
-        return relevant if relevant else [
-            {
-                "text": match.metadata.get("text", ""),
-                "score": match.score,
-                "id": match.id,
-            }
-            for match in matches[:2]
-        ]
-
-    except Exception as e:
-        logger.error(f"Query failed: {e}")
-        return []
-
-
-def generate_precise_answer(question: str, chunks: List[Dict[str, Any]]) -> str:
-    """Generate an answer from Gemini using relevant chunks as context"""
-    if not chunks:
-        return "I couldn't find relevant information in the policy document for this question."
-
-    context = "\n\n".join(
-        f"POLICY SECTION {i+1} (Relevance: {chunk['score']:.2f}):\n{chunk['text']}"
-        for i, chunk in enumerate(chunks[:3])
-    )
-
-    prompt = f"""You are an expert insurance policy analyst. Use ONLY the provided policy sections to answer the user's question precisely and comprehensively.
-
-REQUIREMENTS:
-- Provide specific, accurate info from the policy.
-- Include exact amounts, percentages, limits when mentioned.
-- List exclusions with bullet points if found.
-- Quote relevant policy language where helpful.
-- If info isn't found in sections, state this clearly.
-- Be comprehensive but focused.
-
-QUESTION: {question}
-
-POLICY SECTIONS:
-{context}
-
-COMPREHENSIVE ANSWER:"""
-
-    try:
-        response = gemini_model.generate_content(prompt)
-        answer = response.text.strip()
-
-        # Clean and optimize answer text
-        answer = re.sub(r'^(Based on.*?policy.*?[,:])\s*', '', answer, flags=re.IGNORECASE)
-        answer = re.sub(r'\s+', ' ', answer)
-
-        return answer
-    except Exception as e:
-        logger.error(f"Answer generation failed: {e}")
-        return "I encountered an error while analyzing the policy. Please try again."
-
-
-async def process_and_store_document():
-    """Process the policy PDF, chunk, embed, and upsert to Pinecone"""
-    try:
-        policy_file = "policy.pdf"
-        if not os.path.exists(policy_file):
-            logger.error("Policy file not found")
-            return
-
-        text = extract_pdf_text(policy_file)
-        chunks = optimal_chunk_text(text, size=900, overlap=100)
-
-        # Clear existing index vectors if any
-        try:
-            stats = index.describe_index_stats()
-            if stats.total_vector_count > 0:
-                index.delete(delete_all=True)
-                await asyncio.sleep(2)
-        except Exception:
-            pass
-
-        batch_size = 6
-        for i in range(0, len(chunks), batch_size):
-            batch_chunks = chunks[i : i + batch_size]
-            vectors = []
-            for j, chunk in enumerate(batch_chunks):
-                try:
-                    embedding = get_high_quality_embedding(chunk)
-                    vectors.append(
-                        {
-                            "id": f"chunk-{i+j}-{int(time.time())}",
-                            "values": embedding,
-                            "metadata": {"text": chunk, "index": i + j},
-                        }
-                    )
-                except Exception as e:
-                    logger.warning(f"Chunk {i+j} embedding failed: {e}")
-
-            if vectors:
-                index.upsert(vectors=vectors)
-                await asyncio.sleep(0.5)  # avoid rate limits
-
-        logger.info(f"Successfully processed and ingested {len(chunks)} chunks.")
-
-    except Exception as e:
-        logger.error(f"Document processing failed: {e}")
-
-
-# Security dependency - API token verification
+# Security
 security = HTTPBearer()
 
+# Environment variables
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    expected = os.getenv("API_BEARER_TOKEN")
-    if not expected or credentials.credentials != expected:
-        raise HTTPException(status_code=403, detail="Invalid API token")
-    return True
+# Global variables for models
+embedding_model = None
+pinecone_client = None
+pc_index = None
 
-
-# Request and response models
 class QueryRequest(BaseModel):
+    document_url: HttpUrl
     questions: List[str]
 
+class Answer(BaseModel):
+    question: str
+    answer: str
 
 class QueryResponse(BaseModel):
-    answers: List[str]
+    answers: List[Answer]
 
+# Authentication middleware
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    if not API_BEARER_TOKEN or token != API_BEARER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token
+
+# Initialize models and connections
+def initialize_models():
+    global embedding_model, pinecone_client, pc_index
+    
+    try:
+        # Initialize Gemini
+        if not API_BEARER_TOKEN:
+            raise ValueError("API_BEARER_TOKEN not found in environment variables")
+        # Initialize Gemini API
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # Initialize embedding model (no API key needed - open source model)
+        logger.info("Loading paraphrase-MiniLM-L6-v2 model...")
+        embedding_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
+        logger.info("Embedding model loaded successfully")
+        
+        # Initialize Pinecone
+        if not PINECONE_API_KEY:
+            raise ValueError("PINECONE_API_KEY not found in environment variables")
+        
+        pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+        pc_index = pinecone_client.Index("first")
+        logger.info("Pinecone connection established")
+        
+    except Exception as e:
+        logger.error(f"Error initializing models: {e}")
+        raise
+
+def extract_text_from_pdf(pdf_url: str) -> str:
+    """Extract text from PDF URL"""
+    try:
+        response = requests.get(pdf_url, timeout=30)
+        response.raise_for_status()
+        
+        pdf_file = BytesIO(response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        
+        return text.strip()
+    except Exception as e:
+        logger.error(f"Error extracting PDF text: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to extract PDF text: {str(e)}")
+
+def chunk_text(text: str, chunk_size: 400, overlap: 50) -> List[str]:
+    """Chunk text with overlap using tiktoken for token counting"""
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        tokens = encoding.encode(text)
+        
+        chunks = []
+        start = 0
+        
+        while start < len(tokens):
+            end = start + chunk_size
+            chunk_tokens = tokens[start:end]
+            chunk_text = encoding.decode(chunk_tokens)
+            chunks.append(chunk_text)
+            
+            if end >= len(tokens):
+                break
+            
+            start = end - overlap
+        
+        return chunks
+    except Exception as e:
+        logger.error(f"Error chunking text: {e}")
+        # Fallback to simple text chunking
+        words = text.split()
+        chunk_size_words = chunk_size // 4  # Rough approximation
+        overlap_words = overlap // 4
+        
+        chunks = []
+        start = 0
+        while start < len(words):
+            end = start + chunk_size_words
+            chunk = " ".join(words[start:end])
+            chunks.append(chunk)
+            
+            if end >= len(words):
+                break
+            
+            start = end - overlap_words
+        
+        return chunks
+
+def generate_embeddings(texts: List[str]) -> List[List[float]]:
+    """Generate embeddings for text chunks"""
+    try:
+        embeddings = embedding_model.encode(texts, convert_to_tensor=False)
+        return embeddings.tolist()
+    except Exception as e:
+        logger.error(f"Error generating embeddings: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {str(e)}")
+
+def store_embeddings_in_pinecone(chunks: List[str], embeddings: List[List[float]], doc_id: str):
+    """Store embeddings in Pinecone"""
+    try:
+        vectors = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            vectors.append({
+                "id": f"{doc_id}_chunk_{i}",
+                "values": embedding,
+                "metadata": {
+                    "text": chunk[:1000],  # Limit metadata size
+                    "doc_id": doc_id,
+                    "chunk_index": i
+                }
+            })
+        
+        # Upsert in batches
+        batch_size = 100
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i:i + batch_size]
+            pc_index.upsert(vectors=batch)
+        
+        logger.info(f"Stored {len(vectors)} vectors in Pinecone")
+        
+    except Exception as e:
+        logger.error(f"Error storing embeddings: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store embeddings: {str(e)}")
+
+def search_similar_chunks(query: str, top_k: int = 5) -> List[str]:
+    """Search for similar chunks in Pinecone"""
+    try:
+        query_embedding = embedding_model.encode([query], convert_to_tensor=False)[0].tolist()
+        
+        search_results = pc_index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        contexts = []
+        for match in search_results.matches:
+            if match.score > 0.5:  # Similarity threshold
+                contexts.append(match.metadata.get('text', ''))
+        
+        return contexts
+        
+    except Exception as e:
+        logger.error(f"Error searching chunks: {e}")
+        return []
+
+def generate_answer_with_gemini(question: str, contexts: List[str]) -> str:
+    """Generate answer using Gemini 1.5 Flash"""
+    try:
+        context_text = "\n\n".join(contexts[:3])  # Use top 3 contexts
+        
+        prompt = f"""Based on the following context, provide a precise and accurate answer to the question. If the answer cannot be found in the context, say "I cannot find this information in the provided document."
+
+Context:
+{context_text}
+
+Question: {question}
+
+Answer:"""
+
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                'temperature': 0.1,
+                'top_p': 0.8,
+                'top_k': 40,
+                'max_output_tokens': 1024,
+            }
+        )
+        
+        return response.text.strip()
+        
+    except Exception as e:
+        logger.error(f"Error generating answer with Gemini: {e}")
+        return f"Error generating answer: {str(e)}"
 
 @app.on_event("startup")
 async def startup_event():
-    initialize_services()
-    if status["ready"]:
-        asyncio.create_task(process_and_store_document())
-
-
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def process_queries(req: QueryRequest, verified: bool = Depends(verify_token)):
-    if not status["ready"]:
-        raise HTTPException(status_code=503, detail="Service not ready")
-
-    answers = []
-    for question in req.questions:
-        try:
-            chunks = query_relevant_chunks(question, top_k=3)
-            answer = generate_precise_answer(question, chunks)
-            answers.append(answer)
-        except Exception as e:
-            answers.append(f"Error processing question: {str(e)}")
-
-    return QueryResponse(answers=answers)
-
+    """Initialize models on startup"""
+    initialize_models()
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy" if status["ready"] else "initializing", "index": index_name}
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": time.time()}
 
-
-@app.get("/debug")
-async def debug_info():
-    """Provide debug info about index and status"""
+@app.post("/api/hackrx/run", response_model=QueryResponse)
+async def process_query(
+    request: QueryRequest,
+    token: str = Depends(verify_token)
+):
+    """Main API endpoint for processing queries"""
     try:
-        if not index:
-            return {"error": "Index not ready"}
-
-        stats = index.describe_index_stats()
-        return {
-            "vectors_stored": stats.total_vector_count,
-            "embedding_model": "all-MiniLM-L6-v2",
-            "status": status,
-        }
+        start_time = time.time()
+        
+        # Extract text from PDF
+        logger.info(f"Processing document: {request.document_url}")
+        pdf_text = extract_text_from_pdf(str(request.document_url))
+        
+        # Chunk the text
+        chunks = chunk_text(pdf_text)
+        logger.info(f"Created {len(chunks)} chunks")
+        
+        # Generate embeddings
+        embeddings = generate_embeddings(chunks)
+        
+        # Store in Pinecone with unique doc ID
+        doc_id = f"doc_{int(time.time())}"
+        store_embeddings_in_pinecone(chunks, embeddings, doc_id)
+        
+        # Process questions in parallel
+        async def process_question(question: str) -> Answer:
+            try:
+                # Search for relevant contexts
+                contexts = search_similar_chunks(question)
+                
+                # Generate answer
+                answer_text = generate_answer_with_gemini(question, contexts)
+                
+                return Answer(question=question, answer=answer_text)
+            except Exception as e:
+                logger.error(f"Error processing question '{question}': {e}")
+                return Answer(
+                    question=question, 
+                    answer=f"Error processing question: {str(e)}"
+                )
+        
+        # Process all questions
+        tasks = [process_question(q) for q in request.questions]
+        answers = await asyncio.gather(*tasks)
+        
+        # Clean up memory
+        gc.collect()
+        
+        processing_time = time.time() - start_time
+        logger.info(f"Processed {len(request.questions)} questions in {processing_time:.2f}s")
+        
+        return QueryResponse(answers=answers)
+        
     except Exception as e:
-        return {"error": str(e)}
-
+        logger.error(f"Error in process_query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
-        "name": "Ultra-Optimized Insurance RAG API",
-        "embedding_quality": "High (all-MiniLM-L6-v2)",
-        "size_optimized": True,
-        "status": status,
+        "message": "Railway Semantic Search API",
+        "version": "1.0.0",
+        "status": "active"
     }
-
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
