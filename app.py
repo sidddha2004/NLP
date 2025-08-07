@@ -60,11 +60,10 @@ class QueryRequest(BaseModel):
     questions: List[str]
 
 class Answer(BaseModel):
-    question: str
     answer: str
 
 class QueryResponse(BaseModel):
-    answers: List[Answer]
+    answers: List[str]
 
 # Authentication middleware
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -203,7 +202,7 @@ def store_embeddings_in_pinecone(chunks: List[str], embeddings: List[List[float]
         logger.error(f"Error storing embeddings: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store embeddings: {str(e)}")
 
-def search_similar_chunks(query: str, top_k: int = 5) -> List[str]:
+def search_similar_chunks(query: str, top_k: int = 10) -> List[str]:
     """Search for similar chunks in Pinecone"""
     try:
         query_embedding = embedding_model.encode([query], convert_to_tensor=False)[0].tolist()
@@ -214,11 +213,17 @@ def search_similar_chunks(query: str, top_k: int = 5) -> List[str]:
             include_metadata=True
         )
         
-        contexts = []
-        for match in search_results.matches:
-            if match.score > 0.5:  # Similarity threshold
-                contexts.append(match.metadata.get('text', ''))
+        logger.info(f"Search for '{query}' returned {len(search_results.matches)} matches")
         
+        contexts = []
+        for i, match in enumerate(search_results.matches):
+            logger.info(f"Match {i}: score={match.score:.3f}")
+            # Lower the threshold to get more results
+            if match.score > 0.3:  # Reduced from 0.5 to 0.3
+                contexts.append(match.metadata.get('text', ''))
+                logger.info(f"Added context: {match.metadata.get('text', '')[:100]}...")
+        
+        logger.info(f"Returning {len(contexts)} contexts")
         return contexts
         
     except Exception as e:
@@ -325,27 +330,21 @@ async def process_query_logic(request: QueryRequest):
             logger.info("No document URL provided, searching existing index")
         
         # Process questions in parallel
-        async def process_question(question: str) -> Answer:
+        async def process_question(question: str) -> str:
             try:
                 # Search for relevant contexts (from existing index or newly added document)
                 contexts = search_similar_chunks(question)
                 
                 if not contexts:
-                    return Answer(
-                        question=question, 
-                        answer="No relevant information found in the indexed documents."
-                    )
+                    return "No relevant information found in the indexed documents."
                 
                 # Generate answer
                 answer_text = generate_answer_with_gemini(question, contexts)
                 
-                return Answer(question=question, answer=answer_text)
+                return answer_text
             except Exception as e:
                 logger.error(f"Error processing question '{question}': {e}")
-                return Answer(
-                    question=question, 
-                    answer=f"Error processing question: {str(e)}"
-                )
+                return f"Error processing question: {str(e)}"
         
         # Process all questions
         tasks = [process_question(q) for q in request.questions]
@@ -380,18 +379,34 @@ async def root():
 @app.get("/debug")
 async def debug_info():
     """Debug endpoint to check app status"""
-    return {
-        "app_status": "running",
-        "models_loaded": embedding_model is not None,
-        "pinecone_connected": pc_index is not None,
-        "available_routes": [str(route.path) for route in app.routes],
-        "environment_vars": {
-            "API_BEARER_TOKEN": "***" if API_BEARER_TOKEN else "MISSING",
-            "GEMINI_API_KEY": "***" if GEMINI_API_KEY else "MISSING",
-            "PINECONE_API_KEY": "***" if PINECONE_API_KEY else "MISSING",
-            "PORT": os.getenv("PORT", "8000")
+    try:
+        # Check Pinecone index stats
+        index_stats = pc_index.describe_index_stats()
+        
+        return {
+            "app_status": "running",
+            "models_loaded": embedding_model is not None,
+            "pinecone_connected": pc_index is not None,
+            "pinecone_stats": {
+                "total_vectors": index_stats.total_vector_count,
+                "namespaces": index_stats.namespaces,
+                "dimension": index_stats.dimension
+            },
+            "available_routes": [str(route.path) for route in app.routes],
+            "environment_vars": {
+                "API_BEARER_TOKEN": "***" if API_BEARER_TOKEN else "MISSING",
+                "GEMINI_API_KEY": "***" if GEMINI_API_KEY else "MISSING",
+                "PINECONE_API_KEY": "***" if PINECONE_API_KEY else "MISSING",
+                "PORT": os.getenv("PORT", "8000")
+            }
         }
-    }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "app_status": "running",
+            "models_loaded": embedding_model is not None,
+            "pinecone_connected": pc_index is not None
+        }
 
 # Add a catch-all route for debugging
 from fastapi import Request
@@ -419,7 +434,7 @@ async def catch_all(path: str, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8080))
     logger.info(f"Starting server on port {port}")
     logger.info(f"Available routes:")
     for route in app.routes:
