@@ -61,6 +61,7 @@ executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for CPU-bound tasks
 
 class QueryRequest(BaseModel):
     document_url: Optional[HttpUrl] = None
+    documents: Optional[str] = None  # Support both formats
     questions: List[str]
 
 class QueryResponse(BaseModel):
@@ -222,7 +223,8 @@ def smart_filter_contexts(search_results: List[Dict[str, Any]], query: str) -> L
             relevance_score += overlap_ratio * 0.05
         
         # Boost score for important keywords (domain-specific terms)
-        important_keywords = ['railway', 'train', 'station', 'track', 'signal', 'safety', 'maintenance', 'schedule']
+        important_keywords = ['railway', 'train', 'station', 'track', 'signal', 'safety', 'maintenance', 'schedule',
+                             'policy', 'premium', 'mediclaim', 'insurance', 'coverage', 'claim', 'benefit', 'waiting', 'period']
         for keyword in important_keywords:
             if keyword in text_lower and keyword in query_lower:
                 relevance_score += 0.02
