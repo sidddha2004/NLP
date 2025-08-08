@@ -1,7 +1,31 @@
-fastapi
-uvicorn[standard]
-aiohttp
-PyPDF2
-pydantic
-google-generativeai
-sentence-transformers
+# Core FastAPI and async dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# Authentication
+python-multipart==0.0.6
+
+# PDF processing (lightweight)
+PyPDF2==3.0.1
+
+# HTTP client
+aiohttp==3.9.1
+
+# Google Gemini API
+google-generativeai==0.3.2
+
+# Sentence Transformers (lightweight version)
+sentence-transformers==2.2.2
+
+# Essential ML libraries (minimal versions)
+torch==2.1.1+cpu --index-url https://download.pytorch.org/whl/cpu
+torchvision==0.16.1+cpu --index-url https://download.pytorch.org/whl/cpu
+numpy==1.24.4
+scikit-learn==1.3.2
+
+# Keep transformers version compatible but minimal
+transformers==4.35.2
+
+# Essential utilities
+requests==2.31.0
