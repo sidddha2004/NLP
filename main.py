@@ -5,8 +5,10 @@ import asyncio
 import aiohttp
 import io
 import json
-from typing import List, Dict
+import re
+from typing import List, Dict, Tuple
 from datetime import datetime
+from collections import Counter
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -36,7 +38,7 @@ document_store: Dict[str, Dict] = {}
 
 # Environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN", "default_token")
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable")
@@ -76,13 +78,15 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     try:
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
         text_parts = []
-        max_pages = min(50, len(pdf_reader.pages))
+        max_pages = min(100, len(pdf_reader.pages))  # Increased for better accuracy
         
         for page_num in range(max_pages):
             try:
                 page = pdf_reader.pages[page_num]
                 page_text = page.extract_text()
                 if page_text and page_text.strip():
+                    # Clean up the text
+                    page_text = re.sub(r'\s+', ' ', page_text.strip())
                     text_parts.append(page_text)
             except Exception as e:
                 logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
@@ -95,111 +99,220 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     except Exception as e:
         raise HTTPException(400, f"Error extracting text from PDF: {str(e)}")
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
-    """Create larger chunks since we're using Gemini for both embedding and answering"""
-    words = text.split()
-    if len(words) == 0:
-        return [text] if text.strip() else []
+def chunk_text_smart(text: str, chunk_size: int = 800, overlap: int = 150) -> List[Dict]:
+    """Smart chunking with sentence awareness and metadata"""
+    
+    # Split by sentences first
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     
     chunks = []
-    step_size = max(chunk_size - overlap, 100)  # Ensure minimum step size
+    current_chunk = ""
+    current_sentences = []
     
-    for i in range(0, len(words), step_size):
-        chunk_words = words[i:i + chunk_size]
-        chunk = ' '.join(chunk_words)
-        if chunk.strip():
-            chunks.append(chunk.strip())
-        if i + chunk_size >= len(words):
-            break
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= chunk_size:
+            current_chunk += sentence + " "
+            current_sentences.append(sentence)
+        else:
+            if current_chunk.strip():
+                # Extract keywords for better retrieval
+                keywords = extract_keywords(current_chunk)
+                chunks.append({
+                    'text': current_chunk.strip(),
+                    'sentences': current_sentences.copy(),
+                    'keywords': keywords,
+                    'length': len(current_chunk)
+                })
+            
+            # Start new chunk with overlap
+            overlap_text = " ".join(current_sentences[-2:]) if len(current_sentences) >= 2 else ""
+            current_chunk = overlap_text + " " + sentence + " "
+            current_sentences = current_sentences[-2:] + [sentence] if len(current_sentences) >= 2 else [sentence]
     
-    return chunks if chunks else ([text] if text.strip() else [])
+    # Add final chunk
+    if current_chunk.strip():
+        keywords = extract_keywords(current_chunk)
+        chunks.append({
+            'text': current_chunk.strip(),
+            'sentences': current_sentences,
+            'keywords': keywords,
+            'length': len(current_chunk)
+        })
+    
+    return chunks
 
-async def get_relevant_chunks(question: str, chunks: List[str], top_k: int = 3) -> List[str]:
-    """Use Gemini to find most relevant chunks instead of vector similarity"""
+def extract_keywords(text: str, top_k: int = 10) -> List[str]:
+    """Extract important keywords from text"""
+    # Remove common stop words
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'this', 'that', 'these', 'those'}
+    
+    # Extract words (alphanumeric, length > 2)
+    words = re.findall(r'\b[a-zA-Z0-9]{3,}\b', text.lower())
+    
+    # Filter stop words and count
+    filtered_words = [word for word in words if word not in stop_words]
+    word_counts = Counter(filtered_words)
+    
+    return [word for word, count in word_counts.most_common(top_k)]
+
+def calculate_text_similarity(text1: str, text2: str) -> float:
+    """Simple text similarity using keyword overlap"""
+    keywords1 = set(extract_keywords(text1, 20))
+    keywords2 = set(extract_keywords(text2, 20))
+    
+    if not keywords1 or not keywords2:
+        return 0.0
+    
+    intersection = len(keywords1.intersection(keywords2))
+    union = len(keywords1.union(keywords2))
+    
+    return intersection / union if union > 0 else 0.0
+
+async def get_relevant_chunks_hybrid(question: str, chunks: List[Dict], top_k: int = 5) -> List[str]:
+    """Hybrid approach: keyword similarity + Gemini ranking for better accuracy"""
+    
     if not chunks:
         return []
     
     if len(chunks) <= top_k:
-        return chunks
+        return [chunk['text'] for chunk in chunks]
+    
+    # Step 1: Filter chunks using keyword similarity
+    question_keywords = set(extract_keywords(question, 15))
+    
+    chunk_scores = []
+    for i, chunk in enumerate(chunks):
+        # Keyword similarity score
+        chunk_keywords = set(chunk['keywords'])
+        keyword_score = len(question_keywords.intersection(chunk_keywords)) / max(len(question_keywords), 1)
+        
+        # Text similarity score
+        text_similarity = calculate_text_similarity(question, chunk['text'])
+        
+        # Combined score
+        combined_score = (keyword_score * 0.6) + (text_similarity * 0.4)
+        
+        chunk_scores.append((i, combined_score, chunk))
+    
+    # Sort by score and take top candidates (more than final top_k)
+    chunk_scores.sort(key=lambda x: x[1], reverse=True)
+    top_candidates = chunk_scores[:min(10, len(chunk_scores))]  # Take top 10 candidates
+    
+    # Step 2: Use Gemini to rank the top candidates
+    try:
+        candidate_chunks = [item[2] for item in top_candidates]
+        gemini_ranked = await rank_chunks_with_gemini(question, candidate_chunks, top_k)
+        return gemini_ranked
+    except Exception as e:
+        logger.error(f"Error in Gemini ranking: {e}")
+        # Fallback to keyword-based ranking
+        return [item[2]['text'] for item in top_candidates[:top_k]]
+
+async def rank_chunks_with_gemini(question: str, chunks: List[Dict], top_k: int) -> List[str]:
+    """Use Gemini to rank pre-filtered chunks"""
+    
+    if len(chunks) <= top_k:
+        return [chunk['text'] for chunk in chunks]
     
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # Limit chunks to prevent token overflow
-        limited_chunks = chunks[:15]  # Process max 15 chunks at once
-        
-        # Create a prompt to rank chunks by relevance
+        # Create ranking prompt with shortened chunks
         chunks_text = ""
-        for i, chunk in enumerate(limited_chunks):
-            chunks_text += f"CHUNK {i+1}:\n{chunk[:800]}\n\n---\n\n"  # Limit each chunk to 800 chars
+        for i, chunk in enumerate(chunks):
+            shortened_text = chunk['text'][:600]  # Limit each chunk
+            chunks_text += f"CHUNK {i+1}:\n{shortened_text}\n\n---\n\n"
         
         prompt = f"""Question: "{question}"
 
-Below are text chunks. Rate each chunk's relevance to answering the question (1-10).
-Return ONLY the numbers of the {top_k} most relevant chunks, comma-separated.
+Rank these text chunks by relevance to answering the question. Consider:
+1. Direct relevance to the question
+2. Specific information that helps answer the question
+3. Context that supports the answer
 
 {chunks_text}
 
-Response format: "1,3,7" (just the numbers)"""
+Return ONLY the {top_k} most relevant chunk numbers in order of relevance, comma-separated.
+Example: "3,1,7"
+Response:"""
 
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=50,
+                    max_output_tokens=100,
                     temperature=0.1
                 )
             ),
             timeout=30.0
         )
         
-        # Parse the response to get chunk indices
+        # Parse response
         try:
             chunk_indices = [int(x.strip()) - 1 for x in response.text.strip().split(',')]
-            relevant_chunks = [limited_chunks[i] for i in chunk_indices if 0 <= i < len(limited_chunks)]
-            return relevant_chunks[:top_k] if relevant_chunks else chunks[:top_k]
-        except (ValueError, IndexError) as e:
-            logger.warning(f"Failed to parse chunk selection response: {e}")
-            return chunks[:top_k]
+            relevant_chunks = [chunks[i]['text'] for i in chunk_indices if 0 <= i < len(chunks)]
             
-    except asyncio.TimeoutError:
-        logger.warning("Chunk selection timed out, using first chunks")
-        return chunks[:top_k]
+            # If we don't get enough, fill with remaining chunks
+            if len(relevant_chunks) < top_k:
+                remaining = [chunks[i]['text'] for i in range(len(chunks)) if i not in [idx for idx in chunk_indices if 0 <= idx < len(chunks)]]
+                relevant_chunks.extend(remaining[:top_k - len(relevant_chunks)])
+            
+            return relevant_chunks[:top_k]
+            
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Failed to parse Gemini ranking: {e}")
+            return [chunk['text'] for chunk in chunks[:top_k]]
+            
     except Exception as e:
-        logger.error(f"Error in chunk selection: {e}")
-        return chunks[:top_k]
+        logger.error(f"Error in Gemini ranking: {e}")
+        return [chunk['text'] for chunk in chunks[:top_k]]
 
-async def generate_answer(question: str, context: str) -> str:
+async def generate_answer_enhanced(question: str, context: str, chunks_metadata: List[Dict] = None) -> str:
+    """Enhanced answer generation with better prompting"""
+    
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # Limit context length to prevent token overflow
-        limited_context = context[:4000] if len(context) > 4000 else context
+        # Limit context length
+        limited_context = context[:5000] if len(context) > 5000 else context
         
-        prompt = f"""Based on the provided context, answer the question concisely and accurately.
+        prompt = f"""You are an expert document analyst. Answer the question based ONLY on the provided context.
 
-Context:
+INSTRUCTIONS:
+1. Be specific and accurate
+2. Quote relevant parts when helpful
+3. If the answer isn't clearly in the context, say "The document doesn't contain enough information to answer this question"
+4. Be concise but comprehensive
+5. Use bullet points for multiple related points
+
+CONTEXT:
 {limited_context}
 
-Question: {question}
+QUESTION: {question}
 
-Answer:"""
+ANSWER:"""
 
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=500,
-                    temperature=0.2,
-                    top_p=0.8,
+                    max_output_tokens=800,  # Increased for better answers
+                    temperature=0.1,  # Lower temperature for accuracy
+                    top_p=0.9,
                 )
             ),
-            timeout=30.0
+            timeout=45.0  # Increased timeout
         )
         
-        return response.text.strip() if response.text else "No answer generated."
+        answer = response.text.strip() if response.text else "No answer generated."
+        
+        # Post-process the answer
+        if len(answer) < 10:
+            return "The document doesn't contain enough information to provide a meaningful answer to this question."
+        
+        return answer
         
     except asyncio.TimeoutError:
         logger.error("Answer generation timed out")
@@ -217,18 +330,20 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
         try:
             pdf_content = await download_pdf(str(url))
             text = extract_text_from_pdf(pdf_content)
-            chunks = chunk_text(text)
+            chunks = chunk_text_smart(text)  # Using smart chunking
             
             if not chunks:
                 raise HTTPException(400, "No text chunks could be created from the PDF")
             
-            # Store in memory
+            # Store in memory with enhanced metadata
             document_store[doc_hash] = {
                 'chunks': chunks,
                 'url': str(url),
-                'processed_at': datetime.utcnow().isoformat()
+                'processed_at': datetime.utcnow().isoformat(),
+                'total_text_length': len(text),
+                'chunk_count': len(chunks)
             }
-            logger.info(f"Document processed successfully. Chunks: {len(chunks)}")
+            logger.info(f"Document processed successfully. Chunks: {len(chunks)}, Text length: {len(text)}")
         except Exception as e:
             logger.error(f"Error processing document: {e}")
             raise
@@ -239,14 +354,16 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
     
     async def process_single_question(question: str) -> str:
         try:
-            # Get relevant chunks using Gemini
-            relevant_chunks = await get_relevant_chunks(question, chunks, top_k=3)
+            # Get relevant chunks using hybrid approach
+            relevant_chunk_texts = await get_relevant_chunks_hybrid(question, chunks, top_k=5)
             
-            if not relevant_chunks:
+            if not relevant_chunk_texts:
                 return "No relevant information found in the document."
             
-            context = "\n\n".join(relevant_chunks)
-            answer = await generate_answer(question, context)
+            context = "\n\n---\n\n".join(relevant_chunk_texts)
+            
+            # Generate enhanced answer
+            answer = await generate_answer_enhanced(question, context)
             return answer
             
         except Exception as e:
@@ -254,7 +371,7 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             return "An error occurred while processing this question."
     
     # Process questions with limited concurrency
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(3)  # Increased concurrency
     
     async def process_with_semaphore(question: str) -> str:
         async with semaphore:
@@ -284,8 +401,8 @@ async def health_check():
 @app.get("/")
 async def root():
     return {
-        "message": "HackRX Document Q&A System (Optimized)",
-        "version": "1.0.0",
+        "message": "HackRX Document Q&A System (High Accuracy)",
+        "version": "2.0.0",
         "status": "running"
     }
 
@@ -300,7 +417,7 @@ async def process_document_qa(
         
         answers = await asyncio.wait_for(
             process_document_and_questions(request.documents, request.questions),
-            timeout=300.0  # 5 minutes timeout
+            timeout=600.0  # 10 minutes timeout for accuracy
         )
         
         logger.info(f"Successfully processed {len(answers)} answers")
@@ -319,14 +436,13 @@ async def process_document_qa(
 async def cleanup_old_documents():
     while True:
         try:
-            await asyncio.sleep(3600)  # Clean up every hour
-            if len(document_store) > 50:  # Keep only 50 most recent documents
-                # Remove oldest documents
+            await asyncio.sleep(1800)  # Clean up every 30 minutes
+            if len(document_store) > 30:  # Keep only 30 most recent documents
                 sorted_docs = sorted(
                     document_store.items(), 
                     key=lambda x: x[1]['processed_at']
                 )
-                for doc_id, _ in sorted_docs[:-25]:  # Keep only 25 most recent
+                for doc_id, _ in sorted_docs[:-15]:  # Keep only 15 most recent
                     del document_store[doc_id]
                 logger.info(f"Cleaned up old documents. Current count: {len(document_store)}")
         except Exception as e:
@@ -334,15 +450,13 @@ async def cleanup_old_documents():
 
 @app.on_event("startup")
 async def startup():
-    logger.info("Application starting up...")
-    # Start cleanup task in background
+    logger.info("Application starting up with enhanced accuracy features...")
     asyncio.create_task(cleanup_old_documents())
     logger.info("Startup completed successfully")
 
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Application shutting down...")
-    # Clear memory
     document_store.clear()
     logger.info("Shutdown completed")
 
