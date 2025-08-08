@@ -132,8 +132,8 @@ async def generate_embedding_async(text: str) -> List[float]:
     
     return await loop.run_in_executor(executor, _generate_embedding)
 
-async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Dict[str, Any]]:
-    """Enhanced search with better result processing"""
+async def enhanced_search_similar_chunks(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
+    """Enhanced search with better result processing for detailed answers"""
     try:
         logger.info(f"Searching for: '{query}'")
         
@@ -143,7 +143,7 @@ async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Di
         # Generate embedding asynchronously (unchanged)
         query_embedding = await generate_embedding_async(processed_query)
         
-        # Search with slightly higher top_k for better selection
+        # Search with higher top_k for better selection
         search_results = pc_index.query(
             vector=query_embedding,
             top_k=top_k,
@@ -151,20 +151,33 @@ async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Di
             include_values=False
         )
         
-        # Enhanced result processing
+        # Enhanced result processing with better scoring
         results = []
         query_words = set(query.lower().split())
         
+        # Extract key terms that often indicate important information
+        important_patterns = [
+            r'\d+\s*(days?|months?|years?)', r'\d+%', r'sum insured', r'premium', 
+            r'waiting period', r'grace period', r'coverage', r'benefit', r'limit',
+            r'condition', r'eligibility', r'defined', r'means', r'includes'
+        ]
+        
         for match in search_results.matches:
-            if match.metadata and match.score > 0.08:  # Slightly lower threshold
+            if match.metadata and match.score > 0.06:  # Lower threshold for more results
                 text = match.metadata.get('text', '')
                 
                 # Calculate keyword overlap bonus
                 text_words = set(text.lower().split())
                 keyword_overlap = len(query_words.intersection(text_words)) / len(query_words) if query_words else 0
                 
-                # Enhanced scoring
-                enhanced_score = match.score + (keyword_overlap * 0.1)
+                # Bonus for containing important patterns
+                pattern_bonus = 0
+                for pattern in important_patterns:
+                    if re.search(pattern, text.lower()):
+                        pattern_bonus += 0.05
+                
+                # Enhanced scoring with pattern bonus
+                enhanced_score = match.score + (keyword_overlap * 0.12) + pattern_bonus
                 
                 results.append({
                     'id': match.id,
@@ -173,7 +186,8 @@ async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Di
                     'text': text,
                     'doc_id': match.metadata.get('doc_id', ''),
                     'chunk_index': match.metadata.get('chunk_index', 0),
-                    'keyword_overlap': keyword_overlap
+                    'keyword_overlap': keyword_overlap,
+                    'pattern_bonus': pattern_bonus
                 })
         
         # Sort by enhanced score
@@ -187,7 +201,7 @@ async def enhanced_search_similar_chunks(query: str, top_k: int = 12) -> List[Di
         return []
 
 def smart_context_selection(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Smarter context selection with improved filtering"""
+    """Enhanced context selection for comprehensive answers"""
     if not search_results:
         return []
     
@@ -195,88 +209,122 @@ def smart_context_selection(search_results: List[Dict[str, Any]], query: str) ->
     query_lower = query.lower()
     query_keywords = set(query_lower.split())
     
-    # Enhanced context selection logic
+    # Enhanced context selection with better criteria
     for result in search_results:
         text = result['text']
         score = result['enhanced_score']
         keyword_overlap = result.get('keyword_overlap', 0)
+        pattern_bonus = result.get('pattern_bonus', 0)
         
-        # Multi-tier selection criteria
-        if score > 0.3 and keyword_overlap > 0.3:  # High confidence
+        # Multi-tier selection criteria with pattern consideration
+        if score > 0.35 or (score > 0.25 and pattern_bonus > 0.1):  # High confidence
             contexts.append(text)
-        elif score > 0.2 and keyword_overlap > 0.2:  # Medium confidence
+        elif score > 0.22 and keyword_overlap > 0.2:  # Medium confidence
             contexts.append(text)
-        elif score > 0.15 and keyword_overlap > 0.1:  # Lower confidence but some relevance
-            # Additional check for important terms
-            important_terms = ['policy', 'coverage', 'premium', 'benefit', 'waiting', 'period', 
-                             'mediclaim', 'insurance', 'claim', 'discount', 'hospital']
+        elif score > 0.15 and (keyword_overlap > 0.15 or pattern_bonus > 0.05):  # Lower confidence but relevant
+            # Additional check for policy-specific terms
+            important_terms = [
+                'policy', 'coverage', 'premium', 'benefit', 'waiting', 'period', 'grace',
+                'mediclaim', 'insurance', 'claim', 'discount', 'hospital', 'treatment',
+                'sum insured', 'eligibility', 'condition', 'limit', 'defined', 'means',
+                'days', 'months', 'years', 'percentage', 'expenses', 'reimbursement'
+            ]
             if any(term in text.lower() for term in important_terms):
                 contexts.append(text)
         
-        # Limit contexts but allow more for complex queries
-        max_contexts = 6 if len(query.split()) > 8 else 5
+        # Allow more contexts for comprehensive answers
+        max_contexts = 8 if len(query.split()) > 6 else 6
         if len(contexts) >= max_contexts:
             break
     
-    # Fallback with best result
+    # Fallback with best results
     if not contexts and search_results:
         contexts = [search_results[0]['text']]
-        logger.info("Using fallback context")
+        if len(search_results) > 1:
+            contexts.append(search_results[1]['text'])
+        logger.info("Using fallback contexts")
     
-    logger.info(f"Selected {len(contexts)} contexts with improved filtering")
+    logger.info(f"Selected {len(contexts)} contexts for comprehensive answer")
     return contexts
 
 async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
-    """Enhanced answer generation with better prompting"""
+    """Enhanced answer generation optimized for comprehensive policy responses"""
     try:
         if not contexts:
             return "I couldn't find relevant information in the indexed documents to answer this question."
         
-        # Use more contexts but truncate smartly
-        selected_contexts = contexts[:4]  # Increased from 3
+        # Use more contexts for comprehensive answers
+        selected_contexts = contexts[:6]  # Increased for better coverage
         
-        # Smart truncation - keep important parts
+        # Enhanced smart truncation - preserve important details
         processed_contexts = []
         for i, ctx in enumerate(selected_contexts):
-            if len(ctx) > 400:  # Increased from 300
-                # Try to keep the most relevant part
+            if len(ctx) > 600:  # Increased limit for more detail
+                # Prioritize sentences with numbers, percentages, and key terms
                 sentences = ctx.split('. ')
-                relevant_sentences = []
+                scored_sentences = []
                 question_words = set(question.lower().split())
                 
+                # Important patterns for policy documents
+                important_patterns = [
+                    r'\d+\s*(?:days?|months?|years?)', r'\d+%', r'\d+\s*(?:lakhs?|crores?)',
+                    r'sum insured', r'premium', r'waiting period', r'grace period',
+                    r'coverage', r'benefit', r'limit', r'condition', r'eligibility'
+                ]
+                
                 for sentence in sentences:
+                    score = 0
                     sentence_words = set(sentence.lower().split())
-                    if question_words.intersection(sentence_words):
-                        relevant_sentences.append(sentence)
+                    
+                    # Score based on question word overlap
+                    overlap = len(question_words.intersection(sentence_words))
+                    score += overlap * 2
+                    
+                    # Bonus for important patterns
+                    for pattern in important_patterns:
+                        if re.search(pattern, sentence.lower()):
+                            score += 3
+                    
+                    # Bonus for definition patterns
+                    if re.search(r'(?:is defined|means|includes|shall mean)', sentence.lower()):
+                        score += 2
+                    
+                    scored_sentences.append((sentence, score))
+                
+                # Sort by score and take top sentences
+                scored_sentences.sort(key=lambda x: x[1], reverse=True)
+                relevant_sentences = [s[0] for s in scored_sentences[:3]]  # Top 3 sentences
                 
                 if relevant_sentences:
-                    ctx = '. '.join(relevant_sentences[:2])  # Keep top 2 relevant sentences
+                    ctx = '. '.join(relevant_sentences)
                 else:
-                    ctx = ctx[:400]  # Fallback to truncation
+                    ctx = ctx[:600]  # Fallback to truncation
             
             processed_contexts.append(ctx)
         
         context_text = "\n\n".join(processed_contexts)
         
-        logger.info(f"Generating answer with {len(selected_contexts)} enhanced contexts")
+        logger.info(f"Generating comprehensive answer with {len(selected_contexts)} contexts")
         
-        # Updated prompt for direct answers without context references
-        prompt = f"""Based on the provided information from policy documents, answer the question directly and concisely.
+        # Enhanced prompt for detailed, comprehensive answers
+        prompt = f"""Based on the policy information provided, answer the question with complete details including specific numbers, conditions, and requirements.
 
-INFORMATION:
+POLICY INFORMATION:
 {context_text}
 
 QUESTION: {question}
 
 Instructions:
-- Provide only the direct answer to the question
-- Be specific about numbers, periods, percentages, and conditions when mentioned
-- Do not reference contexts, documents, or PDF locations
-- Do not mention where the information comes from
-- If the information is not available, simply state that clearly
-- Keep the answer factual and to the point
+- Provide a comprehensive answer with all relevant details
+- Include specific numbers, percentages, time periods, and amounts when mentioned
+- Include all conditions, requirements, and exceptions
+- Be precise about eligibility criteria and limitations
+- Structure the answer clearly and logically
+- Do not reference sources or document locations
+- If multiple aspects are covered, address them all
+- Use exact terminology from the policy when relevant
 
-ANSWER:"""
+DETAILED ANSWER:"""
 
         # Run Gemini API call in thread pool
         loop = asyncio.get_event_loop()
@@ -286,21 +334,25 @@ ANSWER:"""
             response = model.generate_content(
                 prompt,
                 generation_config={
-                    'temperature': 0.05,  # Lower for more consistent answers
-                    'top_p': 0.7,        # More focused
-                    'top_k': 15,         # More focused
-                    'max_output_tokens': 300,  # Slightly increased for complete answers
+                    'temperature': 0.02,  # Very low for consistency
+                    'top_p': 0.8,        # Slightly higher for comprehensive answers
+                    'top_k': 20,         # More options for detailed responses
+                    'max_output_tokens': 400,  # Increased for comprehensive answers
                 }
             )
             return response.text.strip()
         
         answer = await loop.run_in_executor(executor, _generate_content)
         
-        # Post-process answer for consistency
+        # Enhanced post-processing for policy answers
         answer = re.sub(r'\n+', ' ', answer)  # Remove multiple newlines
         answer = re.sub(r'\s+', ' ', answer)  # Normalize spaces
         
-        logger.info(f"Generated enhanced answer: {len(answer)} chars")
+        # Clean up any remaining artifacts
+        answer = re.sub(r'(?:Context \d+:?|Based on the policy|According to|As per)', '', answer)
+        answer = answer.strip()
+        
+        logger.info(f"Generated comprehensive answer: {len(answer)} chars")
         return answer
         
     except Exception as e:
@@ -404,8 +456,8 @@ async def process_query(
                 question_start = time.time()
                 logger.info(f"Processing: {question}")
                 
-                # Enhanced search with better result selection
-                search_results = await enhanced_search_similar_chunks(question, top_k=10)
+                # Enhanced search with optimized parameters
+                search_results = await enhanced_search_similar_chunks(question, top_k=15)
                 
                 if not search_results:
                     return f"No relevant information found for: '{question}'"
