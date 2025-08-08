@@ -1,57 +1,3 @@
-# @app.post("/hackrx/run", response_model=DocumentResponse)
-# async def process_document_qa(
-#     request: DocumentRequest,
-#     token: str = Depends(verify_token)
-# ) -> DocumentResponse:
-#     """Main endpoint for document Q&A processing"""
-#     try:
-#         logger.info(f"Received request: {len(request.questions)} questions for document")
-#         logger.info(f"Document URL: {str(request.documents)[:100]}...")
-        
-#         start_time = datetime.utcnow()
-        
-#         # Validate that services are initialized
-#         if embedding_model is None:
-#             logger.error("Embedding model not initialized")
-#             raise HTTPException(
-#                 status_code=503,
-#                 detail="Embedding model not initialized. Check logs for details."
-#             )
-            
-#         if index is None:
-#             logger.error("Pinecone index not initialized")
-#             raise HTTPException(
-#                 status_code=503,
-#                 detail="Vector database not initialized. Check logs for details."
-#             )
-        
-#         # Add timeout to prevent hanging requests
-#         try:
-#             # Set a timeout for the entire request processing
-#             answers = await asyncio.wait_for(
-#                 process_document_and_questions(request.documents, request.questions),
-#                 timeout=120.0  # 2 minutes timeout
-#             )
-#         except asyncio.TimeoutError:
-#             logger.error("Request processing timed out")
-#             raise HTTPException(
-#                 status_code=408,
-#                 detail="Request processing timed out. Please try again with fewer questions or a smaller document."
-#             )
-        
-#         processing_time = (datetime.utcnow() - start_time).total_seconds()
-#         logger.info(f"Request processed successfully in {processing_time:.2f} seconds")
-        
-#         return DocumentResponse(answers=answers)
-        
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"Unexpected error in /hackrx/run: {e}", exc_info=True)
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"An unexpected error occurred: {str(e)}"
-#         )
 import os
 import hashlib
 import logging
@@ -71,6 +17,7 @@ from pydantic import BaseModel, HttpUrl, Field
 
 import PyPDF2
 from sentence_transformers import SentenceTransformer
+import pinecone
 from pinecone import Pinecone
 import google.generativeai as genai
 
@@ -164,41 +111,35 @@ async def initialize_services():
     try:
         logger.info("Initializing services...")
         
-        # Initialize Pinecone first (faster)
-        pc_client = Pinecone(api_key=PINECONE_API_KEY)
+        # Initialize Pinecone with older API
+        pinecone.init(api_key=PINECONE_API_KEY, environment='us-east-1-aws')
         
         # Check if index exists, create if not
         try:
-            # Check if index exists first
-            existing_indexes = pc_client.list_indexes()
-            index_exists = any(idx.name == PINECONE_INDEX_NAME for idx in existing_indexes)
+            # For pinecone-client 2.2.4, use different approach
+            existing_indexes = pinecone.list_indexes()
             
-            if index_exists:
-                index = pc_client.Index(PINECONE_INDEX_NAME)
+            if PINECONE_INDEX_NAME in existing_indexes:
+                index = pinecone.Index(PINECONE_INDEX_NAME)
                 logger.info(f"Connected to existing Pinecone index: {PINECONE_INDEX_NAME}")
             else:
                 logger.warning(f"Index not found, creating new index: {PINECONE_INDEX_NAME}")
-                # Updated index creation for Pinecone 3.0.0
-                from pinecone import ServerlessSpec
-                pc_client.create_index(
+                # Create index with older API
+                pinecone.create_index(
                     name=PINECONE_INDEX_NAME,
                     dimension=384,
-                    metric='cosine',
-                    spec=ServerlessSpec(
-                        cloud='aws',
-                        region='us-east-1'
-                    )
+                    metric='cosine'
                 )
                 # Wait for index to be ready
-                await asyncio.sleep(15)  # Increased wait time
-                index = pc_client.Index(PINECONE_INDEX_NAME)
+                await asyncio.sleep(15)
+                index = pinecone.Index(PINECONE_INDEX_NAME)
                 logger.info(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
                 
         except Exception as e:
             logger.error(f"Error with Pinecone index operations: {e}")
-            # Try to connect anyway in case index exists but list failed
+            # Try to connect anyway
             try:
-                index = pc_client.Index(PINECONE_INDEX_NAME)
+                index = pinecone.Index(PINECONE_INDEX_NAME)
                 logger.info(f"Connected to index despite list error")
             except Exception as inner_e:
                 logger.error(f"Failed to connect to index: {inner_e}")
@@ -361,10 +302,10 @@ def check_document_exists(doc_hash: str) -> bool:
     """Check if document embeddings already exist in Pinecone"""
     try:
         namespace = f"doc_{doc_hash}"
-        # Updated for Pinecone 3.0.0 API
+        # Updated for older Pinecone API
         stats = index.describe_index_stats()
-        namespaces = stats.namespaces or {}
-        return namespace in namespaces and namespaces[namespace].vector_count > 0
+        namespaces = stats.get('namespaces', {})
+        return namespace in namespaces and namespaces[namespace].get('vector_count', 0) > 0
     except Exception as e:
         logger.error(f"Error checking document existence: {e}")
         return False
