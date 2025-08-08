@@ -25,18 +25,19 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install torch==2.1.1+cpu torchvision==0.16.1+cpu --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code and startup script
 COPY . .
+COPY start.sh .
 
-# Create cache directory
-RUN mkdir -p /app/.cache
+# Make startup script executable and create cache directory
+RUN chmod +x start.sh && mkdir -p /app/.cache
 
 # Expose port
 EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
-# Start using Python
-CMD ["python", "main.py"]
+# Use the startup script
+CMD ["./start.sh"]
