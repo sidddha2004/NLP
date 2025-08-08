@@ -254,26 +254,27 @@ async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
                 else:
                     ctx = ctx[:400]  # Fallback to truncation
             
-            processed_contexts.append(f"Context {i+1}: {ctx}")
+            processed_contexts.append(ctx)
         
         context_text = "\n\n".join(processed_contexts)
         
         logger.info(f"Generating answer with {len(selected_contexts)} enhanced contexts")
         
-        # Improved prompt for better accuracy
-        prompt = f"""You are an expert insurance policy analyst. Answer the question accurately and concisely based on the provided contexts from insurance policy documents.
+        # Updated prompt for direct answers without context references
+        prompt = f"""Based on the provided information from policy documents, answer the question directly and concisely.
 
-CONTEXTS:
+INFORMATION:
 {context_text}
 
 QUESTION: {question}
 
 Instructions:
-- Provide a direct, factual answer based on the contexts
-- Be specific about numbers, periods, percentages, and conditions
-- If the information is not in the contexts, state that clearly
-- Keep the answer concise but complete (2-4 sentences)
-- Focus on the exact details requested in the question
+- Provide only the direct answer to the question
+- Be specific about numbers, periods, percentages, and conditions when mentioned
+- Do not reference contexts, documents, or PDF locations
+- Do not mention where the information comes from
+- If the information is not available, simply state that clearly
+- Keep the answer factual and to the point
 
 ANSWER:"""
 
@@ -512,5 +513,3 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
-
-
