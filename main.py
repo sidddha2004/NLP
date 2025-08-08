@@ -10,7 +10,7 @@ import threading
 from datetime import datetime
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, Field
@@ -21,7 +21,10 @@ from pinecone import Pinecone
 import google.generativeai as genai
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -30,6 +33,22 @@ app = FastAPI(
     description="RAG-based document Q&A with smart caching",
     version="1.0.0"
 )
+
+# Add request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = datetime.utcnow()
+    
+    # Log request
+    logger.info(f"Request: {request.method} {request.url.path}")
+    
+    response = await call_next(request)
+    
+    # Log response
+    process_time = (datetime.utcnow() - start_time).total_seconds()
+    logger.info(f"Response: {response.status_code} - {process_time:.2f}s")
+    
+    return response
 
 # CORS middleware
 app.add_middleware(
@@ -409,16 +428,26 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
     
     return answers
 
-# Updated startup event handler
+# Startup event handler
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
     try:
+        logger.info("Starting HackRX Q&A System initialization...")
         await initialize_services()
         logger.info("HackRX Q&A System started successfully")
     except Exception as e:
-        logger.error(f"Failed to start services: {e}")
+        logger.error(f"Failed to start services: {e}", exc_info=True)
         # Don't raise here to allow the app to start and show health status
+
+# Shutdown event handler
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global executor
+    if executor:
+        executor.shutdown(wait=True)
+    logger.info("HackRX Q&A System shutdown complete")
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -440,49 +469,90 @@ async def health_check():
         services=services_status
     )
 
-@app.post("/hackrx/run", response_model=DocumentResponse)
-async def process_document_qa(
-    request: DocumentRequest,
-    token: str = Depends(verify_token)
-) -> DocumentResponse:
-    """Main endpoint for document Q&A processing"""
-    try:
-        logger.info(f"Processing request with {len(request.questions)} questions")
-        start_time = datetime.utcnow()
-        
-        # Validate that services are initialized
-        if embedding_model is None or index is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Services not fully initialized. Please check /health endpoint."
-            )
-        
-        # Process document and questions
-        answers = await process_document_and_questions(request.documents, request.questions)
-        
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
-        logger.info(f"Request processed in {processing_time:.2f} seconds")
-        
-        return DocumentResponse(answers=answers)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in /hackrx/run: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="An unexpected error occurred while processing your request"
-        )
-
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
         "message": "HackRX Document Q&A System",
         "version": "1.0.0",
-        "docs_url": "/docs",
-        "health_url": "/health"
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs", 
+            "main_endpoint": "/hackrx/run",
+            "debug": "/debug"
+        },
+        "status": "running"
     }
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check system status"""
+    return {
+        "embedding_model_loaded": embedding_model is not None,
+        "pinecone_connected": index is not None,
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "environment": {
+            "pinecone_index": PINECONE_INDEX_NAME,
+            "bearer_token_set": bool(HACKRX_BEARER_TOKEN)
+        }
+    }
+
+@app.post("/test", response_model=Dict)
+async def test_endpoint():
+    """Test endpoint without authentication for debugging"""
+    return {
+        "status": "success",
+        "message": "Test endpoint is working",
+        "services": {
+            "embedding_model": embedding_model is not None,
+            "pinecone": index is not None,
+            "gemini": bool(GEMINI_API_KEY)
+        }
+    }
+
+@app.post("/api/v1/hackrx/run", response_model=DocumentResponse)
+async def process_document_qa(
+    request: DocumentRequest,
+    token: str = Depends(verify_token)
+) -> DocumentResponse:
+    """Main endpoint for document Q&A processing"""
+    try:
+        logger.info(f"Received request: {len(request.questions)} questions for document")
+        logger.info(f"Document URL: {str(request.documents)[:100]}...")
+        
+        start_time = datetime.utcnow()
+        
+        # Validate that services are initialized
+        if embedding_model is None:
+            logger.error("Embedding model not initialized")
+            raise HTTPException(
+                status_code=503,
+                detail="Embedding model not initialized. Check logs for details."
+            )
+            
+        if index is None:
+            logger.error("Pinecone index not initialized")
+            raise HTTPException(
+                status_code=503,
+                detail="Vector database not initialized. Check logs for details."
+            )
+        
+        # Process document and questions
+        answers = await process_document_and_questions(request.documents, request.questions)
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        logger.info(f"Request processed successfully in {processing_time:.2f} seconds")
+        
+        return DocumentResponse(answers=answers)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in /hackrx/run: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
