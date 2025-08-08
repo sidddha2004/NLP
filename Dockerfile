@@ -19,7 +19,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TRANSFORMERS_CACHE=/app/.cache \
-    SENTENCE_TRANSFORMERS_HOME=/app/.cache
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache \
+    PORT=8000
 
 # Upgrade pip and install wheel
 RUN pip install --upgrade pip setuptools wheel
@@ -49,5 +50,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Start command
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Start command with proper PORT handling
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
