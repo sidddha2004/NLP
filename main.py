@@ -36,7 +36,7 @@ document_store: Dict[str, Dict] = {}
 
 # Environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN", "default_token")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable")
