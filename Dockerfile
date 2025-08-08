@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     curl \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
@@ -19,9 +21,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_CACHE=/app/.cache \
     SENTENCE_TRANSFORMERS_HOME=/app/.cache
 
+# Upgrade pip and install wheel
+RUN pip install --upgrade pip setuptools wheel
+
 # Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --upgrade pip setuptools wheel
+
+# Install PyTorch CPU-only first to avoid conflicts
+RUN pip install torch==2.1.1+cpu torchvision==0.16.1+cpu --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
