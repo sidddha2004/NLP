@@ -306,8 +306,8 @@ async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
         
         logger.info(f"Generating comprehensive answer with {len(selected_contexts)} contexts")
         
-        # Enhanced prompt for detailed, comprehensive answers
-        prompt = f"""Based on the policy information provided, answer the question with complete details including specific numbers, conditions, and requirements.
+        # Updated prompt for concise 1-3 line answers
+        prompt = f"""Based on the policy information provided, answer the question concisely in 1-3 lines maximum.
 
 POLICY INFORMATION:
 {context_text}
@@ -315,16 +315,14 @@ POLICY INFORMATION:
 QUESTION: {question}
 
 Instructions:
-- Provide a comprehensive answer with all relevant details
-- Include specific numbers, percentages, time periods, and amounts when mentioned
-- Include all conditions, requirements, and exceptions
-- Be precise about eligibility criteria and limitations
-- Structure the answer clearly and logically
+- Answer in maximum 1-3 lines only
+- Include the most important details: numbers, percentages, time periods
+- Be direct and to the point
 - Do not reference sources or document locations
-- If multiple aspects are covered, address them all
+- Focus only on the core answer to the question
 - Use exact terminology from the policy when relevant
 
-DETAILED ANSWER:"""
+CONCISE ANSWER:"""
 
         # Run Gemini API call in thread pool
         loop = asyncio.get_event_loop()
@@ -335,24 +333,30 @@ DETAILED ANSWER:"""
                 prompt,
                 generation_config={
                     'temperature': 0.02,  # Very low for consistency
-                    'top_p': 0.8,        # Slightly higher for comprehensive answers
-                    'top_k': 20,         # More options for detailed responses
-                    'max_output_tokens': 400,  # Increased for comprehensive answers
+                    'top_p': 0.7,        # Focused for concise answers
+                    'top_k': 15,         # Limited options for brevity
+                    'max_output_tokens': 150,  # Reduced for short answers
                 }
             )
             return response.text.strip()
         
         answer = await loop.run_in_executor(executor, _generate_content)
         
-        # Enhanced post-processing for policy answers
+        # Enhanced post-processing for concise answers
         answer = re.sub(r'\n+', ' ', answer)  # Remove multiple newlines
         answer = re.sub(r'\s+', ' ', answer)  # Normalize spaces
         
-        # Clean up any remaining artifacts
+        # Clean up any remaining artifacts and ensure brevity
         answer = re.sub(r'(?:Context \d+:?|Based on the policy|According to|As per)', '', answer)
         answer = answer.strip()
         
-        logger.info(f"Generated comprehensive answer: {len(answer)} chars")
+        # If answer is still too long, take only the first sentence or two
+        if len(answer) > 300:
+            sentences = answer.split('. ')
+            if len(sentences) > 2:
+                answer = '. '.join(sentences[:2]) + '.'
+        
+        logger.info(f"Generated concise answer: {len(answer)} chars")
         return answer
         
     except Exception as e:
