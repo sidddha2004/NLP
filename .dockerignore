@@ -1,13 +1,47 @@
+# Git
+.git
+.gitignore
+*.md
+README*
+
+# Python
 __pycache__
 *.pyc
 *.pyo
 *.pyd
 .Python
-env/
-venv/
-build/
-dist/
-.git
-.gitignore
+*.so
 .pytest_cache
-*.egg-info
+.coverage
+
+# Virtual environments
+env
+venv
+ENV
+env.bak
+venv.bak
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentation
+docs/
+*.md
+
+# Tests
+tests/
+test_*
+
+# Development files
+.env.local
+.env.development
