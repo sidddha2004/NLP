@@ -17,7 +17,6 @@ from pydantic import BaseModel, HttpUrl, Field
 
 import PyPDF2
 from sentence_transformers import SentenceTransformer
-import pinecone
 from pinecone import Pinecone
 import google.generativeai as genai
 
@@ -97,24 +96,40 @@ async def initialize_services():
         
         # Check if index exists, create if not
         try:
-            index = pc_client.Index(PINECONE_INDEX_NAME)
-            logger.info(f"Connected to existing Pinecone index: {PINECONE_INDEX_NAME}")
-        except Exception as e:
-            logger.warning(f"Index not found, creating new index: {e}")
-            pc_client.create_index(
-                name=PINECONE_INDEX_NAME,
-                dimension=384,
-                metric='cosine',
-                spec=pinecone.ServerlessSpec(
-                    cloud='aws',
-                    region='us-east-1'
+            # Check if index exists first
+            existing_indexes = pc_client.list_indexes()
+            index_exists = any(idx.name == PINECONE_INDEX_NAME for idx in existing_indexes)
+            
+            if index_exists:
+                index = pc_client.Index(PINECONE_INDEX_NAME)
+                logger.info(f"Connected to existing Pinecone index: {PINECONE_INDEX_NAME}")
+            else:
+                logger.warning(f"Index not found, creating new index: {PINECONE_INDEX_NAME}")
+                # Updated index creation for Pinecone 3.0.0
+                from pinecone import ServerlessSpec
+                pc_client.create_index(
+                    name=PINECONE_INDEX_NAME,
+                    dimension=384,
+                    metric='cosine',
+                    spec=ServerlessSpec(
+                        cloud='aws',
+                        region='us-east-1'
+                    )
                 )
-            )
-            # Wait for index to be ready
-            import time
-            time.sleep(10)
-            index = pc_client.Index(PINECONE_INDEX_NAME)
-            logger.info(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                # Wait for index to be ready
+                await asyncio.sleep(15)  # Increased wait time
+                index = pc_client.Index(PINECONE_INDEX_NAME)
+                logger.info(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                
+        except Exception as e:
+            logger.error(f"Error with Pinecone index operations: {e}")
+            # Try to connect anyway in case index exists but list failed
+            try:
+                index = pc_client.Index(PINECONE_INDEX_NAME)
+                logger.info(f"Connected to index despite list error")
+            except Exception as inner_e:
+                logger.error(f"Failed to connect to index: {inner_e}")
+                raise RuntimeError(f"Could not connect to or create Pinecone index: {e}")
         
         # Initialize embedding model with retry logic
         with model_lock:
@@ -123,7 +138,8 @@ async def initialize_services():
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                        # Use a more stable model that's less likely to have dependency issues
+                        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
                         logger.info("Embedding model initialized successfully")
                         break
                     except Exception as model_error:
@@ -145,7 +161,8 @@ def generate_document_hash(url: str) -> str:
 async def download_pdf(url: str) -> bytes:
     """Download PDF from URL with timeout and error handling"""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        timeout = aiohttp.ClientTimeout(total=60)  # Increased timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(str(url)) as response:
                 if response.status != 200:
                     raise HTTPException(
@@ -166,7 +183,7 @@ async def download_pdf(url: str) -> bytes:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
 
 def extract_text_from_pdf(pdf_content: bytes) -> str:
-    """Extract text from PDF bytes"""
+    """Extract text from PDF bytes with improved error handling"""
     try:
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
@@ -178,7 +195,7 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         for page_num, page in enumerate(pdf_reader.pages):
             try:
                 page_text = page.extract_text()
-                if page_text.strip():
+                if page_text and page_text.strip():
                     text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
             except Exception as e:
                 logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
@@ -196,6 +213,9 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
     """Split text into overlapping chunks"""
     words = text.split()
+    if len(words) == 0:
+        return [text]
+    
     chunks = []
     
     for i in range(0, len(words), chunk_size - overlap):
@@ -211,9 +231,18 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]
 def embed_chunks(chunks: List[str]) -> List[List[float]]:
     """Generate embeddings for text chunks"""
     try:
+        if not chunks:
+            return []
+            
         with model_lock:
             embeddings = embedding_model.encode(chunks, convert_to_tensor=False)
-        return embeddings.tolist()
+        
+        # Ensure we return a list of lists
+        if len(embeddings.shape) == 1:
+            return [embeddings.tolist()]
+        else:
+            return embeddings.tolist()
+            
     except Exception as e:
         logger.error(f"Error generating embeddings: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate embeddings")
@@ -222,8 +251,10 @@ def check_document_exists(doc_hash: str) -> bool:
     """Check if document embeddings already exist in Pinecone"""
     try:
         namespace = f"doc_{doc_hash}"
+        # Updated for Pinecone 3.0.0 API
         stats = index.describe_index_stats()
-        return namespace in stats.get('namespaces', {})
+        namespaces = stats.namespaces or {}
+        return namespace in namespaces and namespaces[namespace].vector_count > 0
     except Exception as e:
         logger.error(f"Error checking document existence: {e}")
         return False
@@ -231,6 +262,9 @@ def check_document_exists(doc_hash: str) -> bool:
 def store_embeddings(doc_hash: str, chunks: List[str], embeddings: List[List[float]], url: str):
     """Store embeddings in Pinecone with metadata"""
     try:
+        if not chunks or not embeddings:
+            raise ValueError("No chunks or embeddings to store")
+            
         namespace = f"doc_{doc_hash}"
         vectors = []
         
@@ -280,7 +314,7 @@ def search_similar_chunks(question: str, doc_hash: str, top_k: int = 5) -> List[
         # Extract text from results
         relevant_chunks = []
         for match in search_results.matches:
-            if 'text' in match.metadata:
+            if match.metadata and 'text' in match.metadata:
                 relevant_chunks.append(match.metadata['text'])
         
         return relevant_chunks
@@ -290,9 +324,10 @@ def search_similar_chunks(question: str, doc_hash: str, top_k: int = 5) -> List[
         raise HTTPException(status_code=500, detail="Failed to search document")
 
 async def generate_answer(question: str, context: str) -> str:
-    """Generate answer using Gemini 2.5 Flash Lite"""
+    """Generate answer using Gemini"""
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Use the correct model name
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = f"""Based on the following context from a document, answer the question accurately and concisely.
 
@@ -339,6 +374,9 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
         text = extract_text_from_pdf(pdf_content)
         chunks = chunk_text(text)
         
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No text chunks could be created from the document")
+        
         # Generate and store embeddings
         embeddings = embed_chunks(chunks)
         store_embeddings(doc_hash, chunks, embeddings, url)
@@ -371,10 +409,16 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
     
     return answers
 
+# Updated startup event handler
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    await initialize_services()
+    try:
+        await initialize_services()
+        logger.info("HackRX Q&A System started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start services: {e}")
+        # Don't raise here to allow the app to start and show health status
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -385,9 +429,13 @@ async def health_check():
         "gemini": "configured" if GEMINI_API_KEY else "not_configured"
     }
     
+    overall_status = "healthy" if all(
+        status in ["connected", "loaded", "configured"] 
+        for status in services_status.values()
+    ) else "unhealthy"
+    
     return HealthResponse(
-        status="healthy" if all(status == "connected" or status == "loaded" or status == "configured" 
-                              for status in services_status.values()) else "unhealthy",
+        status=overall_status,
         timestamp=datetime.utcnow().isoformat(),
         services=services_status
     )
@@ -401,6 +449,13 @@ async def process_document_qa(
     try:
         logger.info(f"Processing request with {len(request.questions)} questions")
         start_time = datetime.utcnow()
+        
+        # Validate that services are initialized
+        if embedding_model is None or index is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Services not fully initialized. Please check /health endpoint."
+            )
         
         # Process document and questions
         answers = await process_document_and_questions(request.documents, request.questions)
@@ -430,7 +485,8 @@ async def root():
     }
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting HackRX Q&A System on port {port}")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
