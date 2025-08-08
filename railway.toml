@@ -1,8 +1,59 @@
+# railway.toml - Railway configuration
 [build]
 builder = "dockerfile"
 
 [deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
-healthcheckTimeout = 300
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3
+healthcheckTimeout = 30
+
+---
+
+# .env.example - Environment variables template
+PINECONE_API_KEY=your_pinecone_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+HACKRX_BEARER_TOKEN=your_secure_bearer_token_here
+PINECONE_INDEX_NAME=hackrx-documents
+PORT=8000
+
+---
+
+# .dockerignore - Files to ignore in Docker build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.env
+.env.local
+.env.*.local
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.git
+.gitignore
+README.md
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+*.log
