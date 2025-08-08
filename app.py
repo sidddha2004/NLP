@@ -372,7 +372,7 @@ async def debug_search_endpoint(
         logger.error(f"Error in debug search: {e}")
         return {"error": str(e)}
 
-@app.post("/hackrx/run", response_model=QueryResponse)
+@app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
