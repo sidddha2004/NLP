@@ -57,8 +57,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN", "028694bf504e52fe16bde850cea655c4d1fe6b7068383fdaf110d3e561e878b6")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx-documents")
 
-if not all([PINECONE_API_KEY, GEMINI_API_KEY, HACKRX_BEARER_TOKEN]):
-    raise ValueError("Missing required environment variables")
+if not all([PINECONE_API_KEY, GEMINI_API_KEY]):
+    raise ValueError("Missing required environment variables: PINECONE_API_KEY or GEMINI_API_KEY")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -153,10 +153,6 @@ async def download_pdf(url: str) -> bytes:
                         detail=f"Failed to download PDF: HTTP {response.status}"
                     )
                 
-                content_type = response.headers.get('content-type', '').lower()
-                if 'pdf' not in content_type and not str(url).lower().endswith('.pdf'):
-                    logger.warning(f"Content-Type: {content_type}, URL: {url}")
-                
                 content = await response.read()
                 if len(content) == 0:
                     raise HTTPException(status_code=400, detail="Downloaded file is empty")
@@ -210,7 +206,7 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]
         if i + chunk_size >= len(words):
             break
     
-    return chunks if chunks else [text]  # Return original text if chunking fails
+    return chunks if chunks else [text]
 
 def embed_chunks(chunks: List[str]) -> List[List[float]]:
     """Generate embeddings for text chunks"""
