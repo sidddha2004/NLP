@@ -508,6 +508,11 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    
+
+
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
 '''
 import os
 import asyncio
@@ -536,14 +541,17 @@ from pinecone import Pinecone
 import numpy as np
 import tiktoken
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure concise logging
+logging.basicConfig(
+    level=logging.WARNING,  # Reduced verbosity
+    format='%(levelname)s: %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Railway Semantic Search API", 
-    version="2.4.0", # Version updated to reflect changes
+    version="2.3.0",
     debug=False,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -579,7 +587,7 @@ auth_cache = {}
 CACHE_TTL = 300  # 5 minutes
 MAX_CACHE_SIZE = 1000
 
-# Updated request model to match your format
+# Request models
 class QueryRequest(BaseModel):
     documents: Optional[str] = None  # Ignored in Phase 2
     questions: List[str]
@@ -621,21 +629,21 @@ def initialize_models():
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # MODIFIED: Switched to a more powerful embedding model for higher accuracy
-        logger.info("Loading all-mpnet-base-v2 model...")
-        embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+        # Initialize embedding model
+        logger.warning("Loading paraphrase-MiniLM-L6-v2 model...")
+        embedding_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
         embedding_model = embedding_model.to('cpu')
         
         # Warm up the model
         _ = embedding_model.encode(["warmup"], normalize_embeddings=True)
-        logger.info("Embedding model loaded and warmed up successfully")
+        logger.warning("Embedding model loaded successfully")
         
         if not PINECONE_API_KEY:
             raise ValueError("PINECONE_API_KEY not found in environment variables")
         
         pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
         pc_index = pinecone_client.Index("first")
-        logger.info("Pinecone connection established")
+        logger.warning("Pinecone connection established")
         
     except Exception as e:
         logger.error(f"Error initializing models: {e}")
@@ -675,195 +683,231 @@ async def generate_embedding_async(text: str) -> List[float]:
     
     return await loop.run_in_executor(executor, _generate_embedding)
 
-async def ultra_enhanced_search(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-    """Ultra-enhanced multi-stage search with caching"""
+async def ultra_enhanced_search(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
+    """More focused search for concise results"""
     try:
         cache_key = get_cache_key(query, top_k)
         if cache_key in search_cache:
-            logger.info(f"Cache hit for query: '{query[:50]}...'")
             return search_cache[cache_key]
         
-        logger.info(f"Multi-stage search for: '{query}'")
-        
-        # Stage 1: Broader retrieval with higher top_k
         processed_query = preprocess_query(query)
         query_embedding = await generate_embedding_async(processed_query)
         
-        # MODIFIED: Increased initial search candidates for better accuracy
+        # Reduced initial search for faster processing
         search_results = pc_index.query(
             vector=query_embedding,
-            top_k=min(top_k * 3, 60),  # Increased from (top_k*2, 40)
+            top_k=min(top_k * 1.5, 25),  # Reduced from top_k * 2, 40
             include_metadata=True,
             include_values=False
         )
         
-        # Stage 2: Enhanced scoring and filtering
+        # More stringent filtering for quality
         results = []
         query_words = set(query.lower().split())
-        query_bigrams = set([f"{query.lower().split()[i]} {query.lower().split()[i+1]}" 
-                             for i in range(len(query.lower().split())-1)])
         
         for match in search_results.matches:
-            if match.metadata and match.score > 0.05:
+            if match.metadata and match.score > 0.1:  # Higher threshold for better quality
                 text = match.metadata.get('text', '')
-                text_lower = text.lower()
-                text_words = set(text_lower.split())
+                text_words = set(text.lower().split())
                 
-                # Multi-factor scoring
                 keyword_overlap = len(query_words.intersection(text_words)) / len(query_words) if query_words else 0
                 
-                bigram_score = 0
-                if query_bigrams:
-                    text_bigrams = set([f"{text_lower.split()[i]} {text_lower.split()[i+1]}" 
-                                        for i in range(len(text_lower.split())-1)])
-                    bigram_matches = query_bigrams.intersection(text_bigrams)
-                    bigram_score = len(bigram_matches) / len(query_bigrams)
+                # Simplified scoring for faster processing
+                enhanced_score = match.score + (keyword_overlap * 0.3)
                 
-                phrase_bonus = 0.1 if query.lower() in text_lower else 0
-                
-                position_score = 0
-                first_match_pos = text_lower.find(query.lower().split()[0]) if query.lower().split() else -1
-                if first_match_pos != -1:
-                    position_score = max(0, (500 - first_match_pos) / 5000)
-                
-                # Combined enhanced score
-                enhanced_score = (match.score + 
-                                (keyword_overlap * 0.1) +  # Tuned weights
-                                (bigram_score * 0.3) +    # Tuned weights
-                                phrase_bonus + 
-                                position_score)
-                
-                results.append({
-                    'id': match.id,
-                    'score': match.score,
-                    'enhanced_score': enhanced_score,
-                    'text': text,
-                    'doc_id': match.metadata.get('doc_id', ''),
-                    'chunk_index': match.metadata.get('chunk_index', 0),
-                    'keyword_overlap': keyword_overlap,
-                    'bigram_score': bigram_score,
-                    'phrase_bonus': phrase_bonus > 0
-                })
+                # Only keep high-quality matches
+                if enhanced_score > 0.3:
+                    results.append({
+                        'id': match.id,
+                        'score': match.score,
+                        'enhanced_score': enhanced_score,
+                        'text': text,
+                        'doc_id': match.metadata.get('doc_id', ''),
+                        'chunk_index': match.metadata.get('chunk_index', 0),
+                        'keyword_overlap': keyword_overlap,
+                    })
         
-        # Stage 3: Smart deduplication and final selection
+        # Sort and limit results
         results.sort(key=lambda x: x['enhanced_score'], reverse=True)
-        
-        final_results = []
-        seen_texts = set()
-        
-        for result in results:
-            text_hash = hashlib.md5(result['text'][:200].encode()).hexdigest()
-            if text_hash not in seen_texts:
-                seen_texts.add(text_hash)
-                final_results.append(result)
-                
-                if len(final_results) >= top_k:
-                    break
+        final_results = results[:top_k]
         
         search_cache[cache_key] = final_results
-        
-        logger.info(f"Multi-stage search completed: {len(final_results)} high-quality matches")
         return final_results
         
     except Exception as e:
-        logger.error(f"Error in ultra-enhanced search: {e}")
+        logger.error(f"Search error: {e}")
         return []
 
 def ultra_smart_context_selection(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Ultra-smart context selection with advanced filtering"""
+    """Ultra-selective context selection for conciseness"""
     if not search_results:
         return []
     
     contexts = []
+    query_lower = query.lower()
+    query_keywords = set(query_lower.split())
     
-    for result in search_results:
-        # Simplified selection logic to pass more good context to the powerful LLM
-        if result['enhanced_score'] > 0.3:
-            contexts.append(result['text'])
-            
-    # MODIFIED: Increased the number of contexts sent to the LLM
-    max_contexts = 10 if len(query.split()) > 10 else 8
-    if len(contexts) >= max_contexts:
-        contexts = contexts[:max_contexts]
+    # More stringent selection criteria
+    for i, result in enumerate(search_results):
+        text = result['text']
+        enhanced_score = result['enhanced_score']
+        keyword_overlap = result.get('keyword_overlap', 0)
+        
+        # Only select highly relevant contexts
+        select_context = False
+        
+        if enhanced_score > 0.5 and keyword_overlap > 0.5:  # Tier 1: Excellent match only
+            select_context = True
+        elif enhanced_score > 0.4 and keyword_overlap > 0.4 and i < 3:  # Tier 2: Very good, top 3 only
+            select_context = True
+        
+        if select_context:
+            contexts.append(text)
+        
+        # Reduced maximum contexts but maintain quality
+        if len(contexts) >= 5:  # Allow up to 5 contexts for comprehensive answers
+            break
     
+    # Ensure we have at least one context
     if not contexts and search_results:
         contexts = [search_results[0]['text']]
-        logger.info("Using fallback context with best score")
     
-    logger.info(f"Ultra-smart selection: {len(contexts)} contexts from {len(search_results)} candidates")
     return contexts
 
 async def ultra_optimized_answer_generation(question: str, contexts: List[str]) -> str:
-    """Ultra-optimized answer generation with improved prompting and model"""
+    """Ultra-optimized answer generation with MAXIMUM conciseness"""
     try:
         if not contexts:
-            return "I couldn't find relevant information in the indexed documents to answer this question."
+            return "The information is not found in the indexed documents."
         
-        # Use more contexts due to larger model context window
-        context_text = "\n\n".join([f"Context {i+1}: {ctx}" for i, ctx in enumerate(contexts)])
+        # Use more contexts to provide comprehensive answers
+        selected_contexts = contexts[:5]  # Increased back to 5
         
-        logger.info(f"Generating answer with {len(contexts)} ultra-optimized contexts")
+        # More generous context truncation for comprehensive answers
+        processed_contexts = []
+        for i, ctx in enumerate(selected_contexts):
+            if len(ctx) > 500:  # Increased from 300 to allow more detail
+                # Find sentences containing question keywords
+                sentences = ctx.split('. ')
+                question_words = set(question.lower().split())
+                
+                # Get top 3 most relevant sentences
+                scored_sentences = []
+                for sentence in sentences:
+                    sentence_words = set(sentence.lower().split())
+                    overlap = len(question_words.intersection(sentence_words))
+                    scored_sentences.append((sentence, overlap))
+                
+                scored_sentences.sort(key=lambda x: x[1], reverse=True)
+                top_sentences = [s[0] for s in scored_sentences[:3]]
+                
+                if top_sentences and scored_sentences[0][1] > 0:
+                    ctx = '. '.join(top_sentences)
+                else:
+                    ctx = ctx[:500]
+            
+            processed_contexts.append(f"Context {i+1}: {ctx}")
         
-        # MODIFIED: Prompt refined for maximum accuracy and CONCISENESS
-        prompt = f"""You are a precise insurance policy expert. Answer the question with exact details from the provided contexts.
+        context_text = "\n\n".join(processed_contexts)
+        
+        # CRITICAL: Balanced concise answer prompt
+        prompt = f"""Answer the question using ONLY the provided contexts. Provide a complete, informative answer that includes all relevant details but avoids unnecessary elaboration.
 
 CONTEXTS:
 {context_text}
 
 QUESTION: {question}
 
-CRITICAL INSTRUCTIONS:
-- Answer in a single, direct sentence if possible. Limit the answer to a maximum of 40 words.
-- Give a direct, factual answer using ONLY information from the contexts.
-- DO NOT use conversational filler like "Based on the context..." or "The answer is...".
-- If exact information isn't in contexts, state "The provided information does not specify." and nothing more.
-- Focus ONLY on what the question asks.
+INSTRUCTIONS:
+- Provide a direct, factual answer using information from the contexts
+- Include specific numbers, percentages, time periods, conditions, and limits mentioned
+- NO introductory phrases like "According to the context" or "Based on the information"  
+- Be comprehensive but concise - include all necessary details in 1-3 sentences
+- Use exact terms and figures from the contexts
+- If information is not in contexts, say "The information is not specified in the provided contexts"
+- Structure as complete sentences with proper grammar
 
 ANSWER:"""
 
         loop = asyncio.get_event_loop()
         
         def _generate_content():
-            # MODIFIED: Switched to a more powerful model for better accuracy
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
             response = model.generate_content(
                 prompt,
                 generation_config={
-                    # MODIFIED: Parameters tuned for factuality and conciseness
-                    'temperature': 0.0,
-                    'top_p': 0.6,
-                    'top_k': 10,
-                    'max_output_tokens': 100,  # Drastically reduced to force concise answers
+                    'temperature': 0.0,    # Maximum consistency
+                    'top_p': 0.4,          # Very focused
+                    'top_k': 5,            # Very focused
+                    'max_output_tokens': 150,  # Increased to accommodate comprehensive but concise answers
                 }
             )
             return response.text.strip()
         
         answer = await loop.run_in_executor(executor, _generate_content)
         
-        # Post-process for consistency and conciseness
+        # Aggressive post-processing for conciseness
         answer = re.sub(r'\n+', ' ', answer)
         answer = re.sub(r'\s+', ' ', answer)
-        answer = answer.replace('*', '')
+        answer = answer.replace('', '').replace('*', '')
         
-        logger.info(f"Ultra-optimized answer generated: {len(answer)} chars")
+        # Remove common verbose phrases but keep sentence structure
+        verbose_phrases = [
+            "According to the context, ",
+            "Based on the information provided, ",
+            "The context states that ",
+            "As mentioned in the context, ",
+            "From the provided information, ",
+            "The answer is ",
+            "It is mentioned that "
+        ]
+        
+        for phrase in verbose_phrases:
+            answer = answer.replace(phrase, "").strip()
+        
+        # Ensure answer starts with capital letter
+        if answer and answer[0].islower():
+            answer = answer[0].upper() + answer[1:]
+        
         return answer
         
     except Exception as e:
-        logger.error(f"Error in ultra-optimized generation: {e}")
-        return f"Error generating answer: {str(e)}"
+        logger.error(f"Error in generation: {e}")
+        return f"Error: {str(e)}"
+
+async def process_single_question(question: str) -> str:
+    """Process single question with concise error handling"""
+    try:
+        search_results = await ultra_enhanced_search(question, top_k=15)  # Increased back to 15
+        
+        if not search_results:
+            return "No relevant information was found."  # Complete sentence
+        
+        contexts = ultra_smart_context_selection(search_results, question)
+        
+        if not contexts:
+            return "The information is not specific enough."  # Complete sentence
+        
+        answer = await ultra_optimized_answer_generation(question, contexts)
+        
+        return answer
+        
+    except Exception as e:
+        logger.error(f"Error processing '{question}': {e}")
+        return f"Processing error: {str(e)[:50]}..."  # Truncated error
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on startup"""
-    logger.info("=== ENHANCED APPLICATION STARTUP ===")
-    logger.info(f"Environment variables:")
-    logger.info(f"  API_BEARER_TOKEN: {'SET' if API_BEARER_TOKEN else 'MISSING'}")
-    logger.info(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
-    logger.info(f"  PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
+    logger.warning("=== APPLICATION STARTUP ===")
+    logger.warning(f"Environment variables:")
+    logger.warning(f"  API_BEARER_TOKEN: {'SET' if API_BEARER_TOKEN else 'MISSING'}")
+    logger.warning(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
+    logger.warning(f"  PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
     
     try:
         initialize_models()
-        logger.info("=== ENHANCED STARTUP COMPLETE ===")
+        logger.warning("=== STARTUP COMPLETE ===")
     except Exception as e:
         logger.error(f"=== STARTUP FAILED: {e} ===")
         raise
@@ -871,7 +915,7 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "version": "2.4.0", "timestamp": time.time()}
+    return {"status": "healthy", "version": "2.3.0", "timestamp": time.time()}
 
 @app.get("/cache-stats")
 async def cache_stats(token: str = Depends(verify_token)):
@@ -890,8 +934,6 @@ async def clear_cache(token: str = Depends(verify_token)):
     search_cache.clear()
     auth_cache.clear()
     return {"message": "Cache cleared successfully"}
-
-# ... (debug endpoints and other routes remain the same) ...
 
 @app.post("/debug-search")
 async def debug_search_endpoint(
@@ -925,8 +967,6 @@ async def debug_search_endpoint(
                         "score": r['score'],
                         "enhanced_score": r['enhanced_score'],
                         "keyword_overlap": r['keyword_overlap'],
-                        "bigram_score": r.get('bigram_score', 0),
-                        "has_phrase": r.get('phrase_bonus', False),
                         "doc_id": r['doc_id'],
                         "text_preview": r['text'][:200] + "..." if len(r['text']) > 200 else r['text']
                     }
@@ -939,7 +979,7 @@ async def debug_search_endpoint(
             }
         }
     except Exception as e:
-        logger.error(f"Error in enhanced debug search: {e}")
+        logger.error(f"Error in debug search: {e}")
         return {"error": str(e)}
 
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
@@ -947,51 +987,19 @@ async def process_query(
     request: QueryRequest,
     token: str = Depends(verify_token)
 ):
-    """ULTRA-ENHANCED main endpoint for processing queries"""
+    """Streamlined query processing"""
     try:
         start_time = time.time()
         
-        if request.documents:
-            logger.info(f"Document field received (ignored): {request.documents[:100]}...")
-        
+        # Reduced logging
         index_stats = pc_index.describe_index_stats()
-        total_vectors = index_stats.total_vector_count
-        
-        logger.info(f"Processing {len(request.questions)} questions with ultra-enhancements")
-        logger.info(f"Index contains {total_vectors} vectors")
-        
-        if total_vectors == 0:
+        if index_stats.total_vector_count == 0:
             return QueryResponse(
-                answers=["The document index is empty. Please index some documents first."] * len(request.questions)
+                answers=["The index is empty."] * len(request.questions)  # Complete sentence
             )
         
-        async def process_single_question(question: str) -> str:
-            try:
-                question_start = time.time()
-                logger.info(f"Ultra-processing: {question}")
-                
-                search_results = await ultra_enhanced_search(question, top_k=15)
-                
-                if not search_results:
-                    return f"No relevant information found for: '{question}'"
-                
-                contexts = ultra_smart_context_selection(search_results, question)
-                
-                if not contexts:
-                    return f"Found related information, but not specific enough for: '{question}'"
-                
-                answer = await ultra_optimized_answer_generation(question, contexts)
-                
-                question_time = time.time() - question_start
-                logger.info(f"Ultra-processed in {question_time:.2f}s")
-                
-                return answer
-                
-            except Exception as e:
-                logger.error(f"Error in ultra-processing '{question}': {e}")
-                return f"Error processing: {str(e)}"
-        
-        semaphore = asyncio.Semaphore(6)
+        # Process questions with higher concurrency for speed
+        semaphore = asyncio.Semaphore(8)  # Increased for faster processing
         
         async def process_with_semaphore(question: str) -> str:
             async with semaphore:
@@ -1000,40 +1008,81 @@ async def process_query(
         tasks = [process_with_semaphore(q) for q in request.questions]
         answers = await asyncio.gather(*tasks)
         
+        # Cleanup cache if needed
         if len(search_cache) > MAX_CACHE_SIZE * 0.8:
             clean_cache()
         
         gc.collect()
         
         processing_time = time.time() - start_time
-        logger.info(f"ULTRA-ENHANCED TOTAL: {len(request.questions)} questions in {processing_time:.2f}s")
+        logger.warning(f"Processed {len(request.questions)} questions in {processing_time:.2f}s")  # Only log summary
         
         return QueryResponse(answers=answers)
         
     except Exception as e:
-        logger.error(f"Error in ultra-enhanced processing: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Processing error: {e}")
+        raise HTTPException(status_code=500, detail="Processing failed")
 
-# ... (other endpoints like /, /debug, etc., are unchanged) ...
+@app.post("/api/hackrx/run", response_model=QueryResponse)
+async def process_query_api(
+    request: QueryRequest,
+    token: str = Depends(verify_token)
+):
+    """Alternative endpoint path"""
+    return await process_query(request, token)
 
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API - Ultra Enhanced Version",
-        "version": "2.4.0",
+        "message": "Railway Semantic Search API - Concise Version",
+        "version": "2.3.0",
         "status": "active",
-        "enhancements": [
-            "Upgraded embedding model (all-mpnet-base-v2)",
-            "Upgraded LLM (gemini-1.5-pro)",
-            "Broader initial search (higher top_k)",
-            "Increased context size for LLM",
-            "Prompt optimized for accuracy and conciseness"
+        "features": [
+            "Balanced concise answers with complete information",
+            "Faster processing",
+            "High-precision context selection",
+            "Streamlined responses"
         ]
     }
 
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint"""
+    try:
+        index_stats = pc_index.describe_index_stats()
+        test_embedding = embedding_model.encode(["test"], normalize_embeddings=True)[0]
+        
+        return {
+            "app_status": "concise-enhanced",
+            "version": "2.3.0",
+            "performance": {
+                "search_cache_size": len(search_cache),
+                "auth_cache_size": len(auth_cache),
+                "max_workers": executor._max_workers
+            },
+            "models": {
+                "embedding_loaded": embedding_model is not None,
+                "embedding_dimension": len(test_embedding),
+                "pinecone_connected": pc_index is not None,
+                "embedding_model": "paraphrase-MiniLM-L6-v2"
+            },
+            "index_stats": {
+                "total_vectors": index_stats.total_vector_count,
+                "dimension": index_stats.dimension
+            },
+            "config": {
+                "API_BEARER_TOKEN": "SET" if API_BEARER_TOKEN else "MISSING",
+                "GEMINI_API_KEY": "SET" if GEMINI_API_KEY else "MISSING",
+                "PINECONE_API_KEY": "SET" if PINECONE_API_KEY else "MISSING"
+            }
+        }
+    except Exception as e:
+        return {"error": str(e), "app_status": "error"}
+
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Enhanced cleanup on shutdown"""
+    """Cleanup on shutdown"""
     executor.shutdown(wait=False)
     search_cache.clear()
     auth_cache.clear()
