@@ -248,7 +248,7 @@ def smart_context_selection(search_results: List[Dict[str, Any]], query: str) ->
     return contexts
 
 async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
-    """Enhanced answer generation optimized for comprehensive policy responses"""
+    """Enhanced answer generation optimized for detailed and factual policy responses"""
     try:
         if not contexts:
             return "I couldn't find relevant information in the indexed documents to answer this question."
@@ -306,8 +306,8 @@ async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
         
         logger.info(f"Generating comprehensive answer with {len(selected_contexts)} contexts")
         
-        # Updated prompt for concise 1-3 line answers
-        prompt = f"""Based on the policy information provided, answer the question concisely in 1-3 lines maximum.
+        # UPDATED PROMPT - Enhanced for detailed, factual answers
+        prompt = f"""Based on the policy information provided, provide a detailed and factual answer that includes all critical information.
 
 POLICY INFORMATION:
 {context_text}
@@ -315,14 +315,18 @@ POLICY INFORMATION:
 QUESTION: {question}
 
 Instructions:
-- Answer in maximum 1-3 lines only
-- Include the most important details: numbers, percentages, time periods
-- Be direct and to the point
-- Do not reference sources or document locations
-- Focus only on the core answer to the question
-- Use exact terminology from the policy when relevant
+- Provide complete, specific information with ALL relevant details
+- ALWAYS include critical numbers: amounts, percentages, time periods (days/months/years), limits
+- Include important conditions using "provided that", "subject to", "if", etc.
+- Extract and include specific terms like "grace period of thirty days", "waiting period of thirty-six months", "capped at 1% of Sum Insured"
+- Make the answer self-contained - include all information someone would need to act on it
+- Be direct and factual, avoid conversational phrases like "According to the document"
+- If there are multiple conditions or requirements, list them clearly
+- Include eligibility criteria, limitations, exclusions if relevant to the question
+- Focus on actionable, specific details rather than general statements
+- Use exact terminology and numbers from the policy
 
-CONCISE ANSWER:"""
+DETAILED ANSWER:"""
 
         # Run Gemini API call in thread pool
         loop = asyncio.get_event_loop()
@@ -333,30 +337,24 @@ CONCISE ANSWER:"""
                 prompt,
                 generation_config={
                     'temperature': 0.02,  # Very low for consistency
-                    'top_p': 0.7,        # Focused for concise answers
-                    'top_k': 15,         # Limited options for brevity
-                    'max_output_tokens': 150,  # Reduced for short answers
+                    'top_p': 0.8,        # Slightly higher for more detailed responses
+                    'top_k': 20,         # More options for comprehensive answers
+                    'max_output_tokens': 300,  # Increased for detailed answers
                 }
             )
             return response.text.strip()
         
         answer = await loop.run_in_executor(executor, _generate_content)
         
-        # Enhanced post-processing for concise answers
+        # Minimal post-processing to preserve detail
         answer = re.sub(r'\n+', ' ', answer)  # Remove multiple newlines
         answer = re.sub(r'\s+', ' ', answer)  # Normalize spaces
         
-        # Clean up any remaining artifacts and ensure brevity
-        answer = re.sub(r'(?:Context \d+:?|Based on the policy|According to|As per)', '', answer)
+        # Clean up any remaining artifacts while preserving content
+        answer = re.sub(r'(?:Context \d+:?|Based on the policy information|According to)', '', answer)
         answer = answer.strip()
         
-        # If answer is still too long, take only the first sentence or two
-        if len(answer) > 300:
-            sentences = answer.split('. ')
-            if len(sentences) > 2:
-                answer = '. '.join(sentences[:2]) + '.'
-        
-        logger.info(f"Generated concise answer: {len(answer)} chars")
+        logger.info(f"Generated detailed answer: {len(answer)} chars")
         return answer
         
     except Exception as e:
