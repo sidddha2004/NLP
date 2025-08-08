@@ -54,7 +54,7 @@ model_lock = threading.Lock()
 # Environment variables
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN", "028694bf504e52fe16bde850cea655c4d1fe6b7068383fdaf110d3e561e878b6")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx-documents")
 
 if not all([PINECONE_API_KEY, GEMINI_API_KEY, HACKRX_BEARER_TOKEN]):
@@ -110,14 +110,27 @@ async def initialize_services():
                     region='us-east-1'
                 )
             )
+            # Wait for index to be ready
+            import time
+            time.sleep(10)
             index = pc_client.Index(PINECONE_INDEX_NAME)
             logger.info(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
         
-        # Initialize embedding model
+        # Initialize embedding model with retry logic
         with model_lock:
             if embedding_model is None:
-                embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
-                logger.info("Embedding model initialized")
+                logger.info("Loading sentence transformer model...")
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                        logger.info("Embedding model initialized successfully")
+                        break
+                    except Exception as model_error:
+                        logger.warning(f"Model loading attempt {attempt + 1} failed: {model_error}")
+                        if attempt == max_retries - 1:
+                            raise RuntimeError(f"Failed to load embedding model after {max_retries} attempts: {model_error}")
+                        await asyncio.sleep(5)
         
         logger.info("All services initialized successfully")
         
@@ -383,7 +396,7 @@ async def health_check():
         services=services_status
     )
 
-@app.post("/api/v1/hackrx/run", response_model=DocumentResponse)
+@app.post("/hackrx/run", response_model=DocumentResponse)
 async def process_document_qa(
     request: DocumentRequest,
     token: str = Depends(verify_token)
