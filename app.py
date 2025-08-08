@@ -1,27 +1,25 @@
 import os
-import asyncio
+import hashlib
 import logging
-from typing import List, Dict, Any, Optional
-import time
-import gc
-import re
-from collections import defaultdict
+import asyncio
+import aiohttp
+import io
+from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
-import json
+import threading
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-import requests
+from pydantic import BaseModel, HttpUrl, Field
+
 import PyPDF2
-from io import BytesIO
 from sentence_transformers import SentenceTransformer
 import pinecone
-import google.generativeai as genai
 from pinecone import Pinecone
-import numpy as np
-import tiktoken
+import google.generativeai as genai
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,11 +27,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Railway Semantic Search API", 
-    version="2.2.0",
-    debug=False,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    title="HackRX Document Q&A System",
+    description="RAG-based document Q&A with smart caching",
+    version="1.0.0"
 )
 
 # CORS middleware
@@ -48,524 +44,388 @@ app.add_middleware(
 # Security
 security = HTTPBearer()
 
+# Global variables for models and clients
+embedding_model = None
+pc_client = None
+index = None
+executor = ThreadPoolExecutor(max_workers=4)
+model_lock = threading.Lock()
+
 # Environment variables
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx-documents")
 
-# Global variables for models
-embedding_model = None
-pinecone_client = None
-pc_index = None
-executor = ThreadPoolExecutor(max_workers=6)  # Increased for better concurrency
+if not all([PINECONE_API_KEY, GEMINI_API_KEY, HACKRX_BEARER_TOKEN]):
+    raise ValueError("Missing required environment variables")
 
-# Updated request model to match your format
-class QueryRequest(BaseModel):
-    documents: Optional[str] = None  # Ignored in Phase 2
-    questions: List[str]
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
-class QueryResponse(BaseModel):
-    answers: List[str]
+# Pydantic models
+class DocumentRequest(BaseModel):
+    documents: HttpUrl = Field(..., description="URL of the PDF document")
+    questions: List[str] = Field(..., min_items=1, max_items=10, description="List of questions")
 
-class SearchDebugRequest(BaseModel):
-    query: str
-    top_k: Optional[int] = 10
+class DocumentResponse(BaseModel):
+    answers: List[str] = Field(..., description="List of answers corresponding to questions")
 
-# Authentication middleware
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if not API_BEARER_TOKEN or token != API_BEARER_TOKEN:
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    services: Dict[str, str]
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify bearer token authentication"""
+    if credentials.credentials != HACKRX_BEARER_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Invalid authentication token"
         )
-    return token
+    return credentials.credentials
 
-def initialize_models():
-    """Initialize models and connections"""
-    global embedding_model, pinecone_client, pc_index
+async def initialize_services():
+    """Initialize all services asynchronously"""
+    global embedding_model, pc_client, index
     
     try:
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY not found in environment variables")
-        genai.configure(api_key=GEMINI_API_KEY)
+        logger.info("Initializing services...")
         
-        # Initialize embedding model with exact same settings as Phase 1
-        logger.info("Loading paraphrase-MiniLM-L6-v2 model...")
-        embedding_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
-        # Set to use CPU for consistent performance
-        embedding_model = embedding_model.to('cpu')
-        logger.info("Embedding model loaded successfully")
+        # Initialize Pinecone
+        pc_client = Pinecone(api_key=PINECONE_API_KEY)
         
-        if not PINECONE_API_KEY:
-            raise ValueError("PINECONE_API_KEY not found in environment variables")
+        # Check if index exists, create if not
+        try:
+            index = pc_client.Index(PINECONE_INDEX_NAME)
+            logger.info(f"Connected to existing Pinecone index: {PINECONE_INDEX_NAME}")
+        except Exception as e:
+            logger.warning(f"Index not found, creating new index: {e}")
+            pc_client.create_index(
+                name=PINECONE_INDEX_NAME,
+                dimension=384,
+                metric='cosine',
+                spec=pinecone.ServerlessSpec(
+                    cloud='aws',
+                    region='us-east-1'
+                )
+            )
+            index = pc_client.Index(PINECONE_INDEX_NAME)
+            logger.info(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
         
-        pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
-        pc_index = pinecone_client.Index("first")
-        logger.info("Pinecone connection established")
+        # Initialize embedding model
+        with model_lock:
+            if embedding_model is None:
+                embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                logger.info("Embedding model initialized")
+        
+        logger.info("All services initialized successfully")
         
     except Exception as e:
-        logger.error(f"Error initializing models: {e}")
+        logger.error(f"Failed to initialize services: {e}")
         raise
 
-def preprocess_query(query: str) -> str:
-    """Preprocess query to match document preprocessing - UNCHANGED to maintain compatibility"""
-    # Clean the query similar to how documents were processed
-    query = re.sub(r'\s+', ' ', query)
-    query = query.strip()
-    return query
+def generate_document_hash(url: str) -> str:
+    """Generate SHA-256 hash for document URL"""
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-# Async wrapper for embedding generation
-async def generate_embedding_async(text: str) -> List[float]:
-    """Generate embedding asynchronously using thread pool - UNCHANGED to maintain compatibility"""
-    loop = asyncio.get_event_loop()
-    
-    def _generate_embedding():
-        return embedding_model.encode(
-            [text], 
-            convert_to_tensor=False,
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )[0].tolist()
-    
-    return await loop.run_in_executor(executor, _generate_embedding)
-
-async def enhanced_search_similar_chunks(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
-    """Enhanced search with better result processing for detailed answers"""
+async def download_pdf(url: str) -> bytes:
+    """Download PDF from URL with timeout and error handling"""
     try:
-        logger.info(f"Searching for: '{query}'")
-        
-        # Preprocess query (unchanged to maintain compatibility)
-        processed_query = preprocess_query(query)
-        
-        # Generate embedding asynchronously (unchanged)
-        query_embedding = await generate_embedding_async(processed_query)
-        
-        # Search with higher top_k for better selection
-        search_results = pc_index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            include_values=False
-        )
-        
-        # Enhanced result processing with better scoring
-        results = []
-        query_words = set(query.lower().split())
-        
-        # Extract key terms that often indicate important information
-        important_patterns = [
-            r'\d+\s*(days?|months?|years?)', r'\d+%', r'sum insured', r'premium', 
-            r'waiting period', r'grace period', r'coverage', r'benefit', r'limit',
-            r'condition', r'eligibility', r'defined', r'means', r'includes'
-        ]
-        
-        for match in search_results.matches:
-            if match.metadata and match.score > 0.06:  # Lower threshold for more results
-                text = match.metadata.get('text', '')
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(str(url)) as response:
+                if response.status != 200:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to download PDF: HTTP {response.status}"
+                    )
                 
-                # Calculate keyword overlap bonus
-                text_words = set(text.lower().split())
-                keyword_overlap = len(query_words.intersection(text_words)) / len(query_words) if query_words else 0
+                content_type = response.headers.get('content-type', '').lower()
+                if 'pdf' not in content_type and not str(url).lower().endswith('.pdf'):
+                    logger.warning(f"Content-Type: {content_type}, URL: {url}")
                 
-                # Bonus for containing important patterns
-                pattern_bonus = 0
-                for pattern in important_patterns:
-                    if re.search(pattern, text.lower()):
-                        pattern_bonus += 0.05
+                content = await response.read()
+                if len(content) == 0:
+                    raise HTTPException(status_code=400, detail="Downloaded file is empty")
                 
-                # Enhanced scoring with pattern bonus
-                enhanced_score = match.score + (keyword_overlap * 0.12) + pattern_bonus
+                return content
                 
-                results.append({
-                    'id': match.id,
-                    'score': match.score,
-                    'enhanced_score': enhanced_score,
-                    'text': text,
-                    'doc_id': match.metadata.get('doc_id', ''),
-                    'chunk_index': match.metadata.get('chunk_index', 0),
-                    'keyword_overlap': keyword_overlap,
-                    'pattern_bonus': pattern_bonus
-                })
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="PDF download timeout")
+    except Exception as e:
+        logger.error(f"Error downloading PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
+
+def extract_text_from_pdf(pdf_content: bytes) -> str:
+    """Extract text from PDF bytes"""
+    try:
+        pdf_file = io.BytesIO(pdf_content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
         
-        # Sort by enhanced score
-        results.sort(key=lambda x: x['enhanced_score'], reverse=True)
+        if len(pdf_reader.pages) == 0:
+            raise ValueError("PDF has no pages")
         
-        logger.info(f"Found {len(results)} matches")
-        return results
+        text = ""
+        for page_num, page in enumerate(pdf_reader.pages):
+            try:
+                page_text = page.extract_text()
+                if page_text.strip():
+                    text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+            except Exception as e:
+                logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
+                continue
+        
+        if not text.strip():
+            raise ValueError("No text could be extracted from PDF")
+        
+        return text.strip()
         
     except Exception as e:
-        logger.error(f"Error in search: {e}")
-        return []
+        logger.error(f"Error extracting text from PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to extract text from PDF: {str(e)}")
 
-def smart_context_selection(search_results: List[Dict[str, Any]], query: str) -> List[str]:
-    """Enhanced context selection for comprehensive answers"""
-    if not search_results:
-        return []
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
+    """Split text into overlapping chunks"""
+    words = text.split()
+    chunks = []
     
-    contexts = []
-    query_lower = query.lower()
-    query_keywords = set(query_lower.split())
-    
-    # Enhanced context selection with better criteria
-    for result in search_results:
-        text = result['text']
-        score = result['enhanced_score']
-        keyword_overlap = result.get('keyword_overlap', 0)
-        pattern_bonus = result.get('pattern_bonus', 0)
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk.strip())
         
-        # Multi-tier selection criteria with pattern consideration
-        if score > 0.35 or (score > 0.25 and pattern_bonus > 0.1):  # High confidence
-            contexts.append(text)
-        elif score > 0.22 and keyword_overlap > 0.2:  # Medium confidence
-            contexts.append(text)
-        elif score > 0.15 and (keyword_overlap > 0.15 or pattern_bonus > 0.05):  # Lower confidence but relevant
-            # Additional check for policy-specific terms
-            important_terms = [
-                'policy', 'coverage', 'premium', 'benefit', 'waiting', 'period', 'grace',
-                'mediclaim', 'insurance', 'claim', 'discount', 'hospital', 'treatment',
-                'sum insured', 'eligibility', 'condition', 'limit', 'defined', 'means',
-                'days', 'months', 'years', 'percentage', 'expenses', 'reimbursement'
-            ]
-            if any(term in text.lower() for term in important_terms):
-                contexts.append(text)
-        
-        # Allow more contexts for comprehensive answers
-        max_contexts = 8 if len(query.split()) > 6 else 6
-        if len(contexts) >= max_contexts:
+        if i + chunk_size >= len(words):
             break
     
-    # Fallback with best results
-    if not contexts and search_results:
-        contexts = [search_results[0]['text']]
-        if len(search_results) > 1:
-            contexts.append(search_results[1]['text'])
-        logger.info("Using fallback contexts")
-    
-    logger.info(f"Selected {len(contexts)} contexts for comprehensive answer")
-    return contexts
+    return chunks if chunks else [text]  # Return original text if chunking fails
 
-async def generate_enhanced_answer(question: str, contexts: List[str]) -> str:
-    """Enhanced answer generation optimized for comprehensive policy responses"""
+def embed_chunks(chunks: List[str]) -> List[List[float]]:
+    """Generate embeddings for text chunks"""
     try:
-        if not contexts:
-            return "I couldn't find relevant information in the indexed documents to answer this question."
-        
-        # Use more contexts for comprehensive answers
-        selected_contexts = contexts[:6]  # Increased for better coverage
-        
-        # Enhanced smart truncation - preserve important details
-        processed_contexts = []
-        for i, ctx in enumerate(selected_contexts):
-            if len(ctx) > 600:  # Increased limit for more detail
-                # Prioritize sentences with numbers, percentages, and key terms
-                sentences = ctx.split('. ')
-                scored_sentences = []
-                question_words = set(question.lower().split())
-                
-                # Important patterns for policy documents
-                important_patterns = [
-                    r'\d+\s*(?:days?|months?|years?)', r'\d+%', r'\d+\s*(?:lakhs?|crores?)',
-                    r'sum insured', r'premium', r'waiting period', r'grace period',
-                    r'coverage', r'benefit', r'limit', r'condition', r'eligibility'
-                ]
-                
-                for sentence in sentences:
-                    score = 0
-                    sentence_words = set(sentence.lower().split())
-                    
-                    # Score based on question word overlap
-                    overlap = len(question_words.intersection(sentence_words))
-                    score += overlap * 2
-                    
-                    # Bonus for important patterns
-                    for pattern in important_patterns:
-                        if re.search(pattern, sentence.lower()):
-                            score += 3
-                    
-                    # Bonus for definition patterns
-                    if re.search(r'(?:is defined|means|includes|shall mean)', sentence.lower()):
-                        score += 2
-                    
-                    scored_sentences.append((sentence, score))
-                
-                # Sort by score and take top sentences
-                scored_sentences.sort(key=lambda x: x[1], reverse=True)
-                relevant_sentences = [s[0] for s in scored_sentences[:3]]  # Top 3 sentences
-                
-                if relevant_sentences:
-                    ctx = '. '.join(relevant_sentences)
-                else:
-                    ctx = ctx[:600]  # Fallback to truncation
-            
-            processed_contexts.append(ctx)
-        
-        context_text = "\n\n".join(processed_contexts)
-        
-        logger.info(f"Generating comprehensive answer with {len(selected_contexts)} contexts")
-        
-        # Updated prompt for concise 1-3 line answers
-        prompt = f"""Based on the policy information provided, answer the question concisely in 1-3 lines maximum.
+        with model_lock:
+            embeddings = embedding_model.encode(chunks, convert_to_tensor=False)
+        return embeddings.tolist()
+    except Exception as e:
+        logger.error(f"Error generating embeddings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate embeddings")
 
-POLICY INFORMATION:
-{context_text}
+def check_document_exists(doc_hash: str) -> bool:
+    """Check if document embeddings already exist in Pinecone"""
+    try:
+        namespace = f"doc_{doc_hash}"
+        stats = index.describe_index_stats()
+        return namespace in stats.get('namespaces', {})
+    except Exception as e:
+        logger.error(f"Error checking document existence: {e}")
+        return False
 
-QUESTION: {question}
-
-Instructions:
-- Answer in maximum 1-3 lines only
-- Include the most important details: numbers, percentages, time periods
-- Be direct and to the point
-- Do not reference sources or document locations
-- Focus only on the core answer to the question
-- Use exact terminology from the policy when relevant
-
-CONCISE ANSWER:"""
-
-        # Run Gemini API call in thread pool
-        loop = asyncio.get_event_loop()
+def store_embeddings(doc_hash: str, chunks: List[str], embeddings: List[List[float]], url: str):
+    """Store embeddings in Pinecone with metadata"""
+    try:
+        namespace = f"doc_{doc_hash}"
+        vectors = []
         
-        def _generate_content():
-            model = genai.GenerativeModel('gemini-1.5-pro')
-            response = model.generate_content(
-                prompt,
-                generation_config={
-                    'temperature': 0.02,  # Very low for consistency
-                    'top_p': 0.7,        # Focused for concise answers
-                    'top_k': 15,         # Limited options for brevity
-                    'max_output_tokens': 150,  # Reduced for short answers
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            vector_id = f"{doc_hash}_{i}"
+            vectors.append({
+                'id': vector_id,
+                'values': embedding,
+                'metadata': {
+                    'text': chunk,
+                    'chunk_index': i,
+                    'document_url': str(url),
+                    'doc_hash': doc_hash,
+                    'timestamp': datetime.utcnow().isoformat()
                 }
-            )
-            return response.text.strip()
+            })
         
-        answer = await loop.run_in_executor(executor, _generate_content)
+        # Batch upsert in chunks of 100
+        batch_size = 100
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i:i + batch_size]
+            index.upsert(vectors=batch, namespace=namespace)
         
-        # Enhanced post-processing for concise answers
-        answer = re.sub(r'\n+', ' ', answer)  # Remove multiple newlines
-        answer = re.sub(r'\s+', ' ', answer)  # Normalize spaces
-        
-        # Clean up any remaining artifacts and ensure brevity
-        answer = re.sub(r'(?:Context \d+:?|Based on the policy|According to|As per)', '', answer)
-        answer = answer.strip()
-        
-        # If answer is still too long, take only the first sentence or two
-        if len(answer) > 300:
-            sentences = answer.split('. ')
-            if len(sentences) > 2:
-                answer = '. '.join(sentences[:2]) + '.'
-        
-        logger.info(f"Generated concise answer: {len(answer)} chars")
-        return answer
+        logger.info(f"Stored {len(vectors)} embeddings for document {doc_hash}")
         
     except Exception as e:
-        logger.error(f"Error generating answer: {e}")
-        return f"Error generating answer: {str(e)}"
+        logger.error(f"Error storing embeddings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to store document embeddings")
+
+def search_similar_chunks(question: str, doc_hash: str, top_k: int = 5) -> List[str]:
+    """Search for similar chunks in Pinecone"""
+    try:
+        # Generate question embedding
+        with model_lock:
+            question_embedding = embedding_model.encode([question])[0].tolist()
+        
+        namespace = f"doc_{doc_hash}"
+        
+        # Search in Pinecone
+        search_results = index.query(
+            vector=question_embedding,
+            top_k=top_k,
+            namespace=namespace,
+            include_metadata=True
+        )
+        
+        # Extract text from results
+        relevant_chunks = []
+        for match in search_results.matches:
+            if 'text' in match.metadata:
+                relevant_chunks.append(match.metadata['text'])
+        
+        return relevant_chunks
+        
+    except Exception as e:
+        logger.error(f"Error searching similar chunks: {e}")
+        raise HTTPException(status_code=500, detail="Failed to search document")
+
+async def generate_answer(question: str, context: str) -> str:
+    """Generate answer using Gemini 2.5 Flash Lite"""
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        
+        prompt = f"""Based on the following context from a document, answer the question accurately and concisely.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Provide a direct, factual answer based only on the given context
+- If the context doesn't contain enough information to answer the question, say "The provided document doesn't contain sufficient information to answer this question."
+- Keep the answer concise but complete
+- Do not make assumptions beyond what's stated in the context
+
+Answer:"""
+
+        response = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=500,
+                    temperature=0.1,
+                )
+            )
+        )
+        
+        return response.text.strip()
+        
+    except Exception as e:
+        logger.error(f"Error generating answer with Gemini: {e}")
+        return "Sorry, I encountered an error while generating the answer. Please try again."
+
+async def process_document_and_questions(url: str, questions: List[str]) -> List[str]:
+    """Main processing pipeline"""
+    doc_hash = generate_document_hash(str(url))
+    
+    # Check if document already processed
+    if not check_document_exists(doc_hash):
+        logger.info(f"Processing new document: {doc_hash}")
+        
+        # Download and process document
+        pdf_content = await download_pdf(str(url))
+        text = extract_text_from_pdf(pdf_content)
+        chunks = chunk_text(text)
+        
+        # Generate and store embeddings
+        embeddings = embed_chunks(chunks)
+        store_embeddings(doc_hash, chunks, embeddings, url)
+        
+        logger.info(f"Document {doc_hash} processed and cached")
+    else:
+        logger.info(f"Using cached document: {doc_hash}")
+    
+    # Process questions
+    answers = []
+    for question in questions:
+        try:
+            # Retrieve relevant chunks
+            relevant_chunks = search_similar_chunks(question, doc_hash)
+            
+            if not relevant_chunks:
+                answers.append("No relevant information found in the document.")
+                continue
+            
+            # Combine chunks as context
+            context = "\n\n".join(relevant_chunks)
+            
+            # Generate answer
+            answer = await generate_answer(question, context)
+            answers.append(answer)
+            
+        except Exception as e:
+            logger.error(f"Error processing question '{question}': {e}")
+            answers.append("An error occurred while processing this question.")
+    
+    return answers
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models on startup"""
-    logger.info("=== APPLICATION STARTUP ===")
-    logger.info(f"Environment variables:")
-    logger.info(f"  API_BEARER_TOKEN: {'SET' if API_BEARER_TOKEN else 'MISSING'}")
-    logger.info(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
-    logger.info(f"  PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
-    
-    try:
-        initialize_models()
-        logger.info("=== STARTUP COMPLETE ===")
-    except Exception as e:
-        logger.error(f"=== STARTUP FAILED: {e} ===")
-        raise
+    """Initialize services on startup"""
+    await initialize_services()
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": time.time()}
+    services_status = {
+        "pinecone": "connected" if index is not None else "disconnected",
+        "embedding_model": "loaded" if embedding_model is not None else "not_loaded",
+        "gemini": "configured" if GEMINI_API_KEY else "not_configured"
+    }
+    
+    return HealthResponse(
+        status="healthy" if all(status == "connected" or status == "loaded" or status == "configured" 
+                              for status in services_status.values()) else "unhealthy",
+        timestamp=datetime.utcnow().isoformat(),
+        services=services_status
+    )
 
-@app.post("/debug-search")
-async def debug_search_endpoint(
-    request: SearchDebugRequest,
+@app.post("/api/v1/hackrx/run", response_model=DocumentResponse)
+async def process_document_qa(
+    request: DocumentRequest,
     token: str = Depends(verify_token)
-):
-    """Debug endpoint for search testing"""
+) -> DocumentResponse:
+    """Main endpoint for document Q&A processing"""
     try:
-        # Get search results
-        search_results = await enhanced_search_similar_chunks(request.query, request.top_k)
+        logger.info(f"Processing request with {len(request.questions)} questions")
+        start_time = datetime.utcnow()
         
-        # Get index stats
-        index_stats = pc_index.describe_index_stats()
+        # Process document and questions
+        answers = await process_document_and_questions(request.documents, request.questions)
         
-        # Process contexts
-        contexts = smart_context_selection(search_results, request.query)
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        logger.info(f"Request processed in {processing_time:.2f} seconds")
         
-        return {
-            "query": request.query,
-            "index_stats": {
-                "total_vectors": index_stats.total_vector_count,
-                "dimension": index_stats.dimension
-            },
-            "search_results": {
-                "total_matches": len(search_results),
-                "matches": [
-                    {
-                        "id": r['id'],
-                        "score": r['score'],
-                        "enhanced_score": r['enhanced_score'],
-                        "keyword_overlap": r['keyword_overlap'],
-                        "doc_id": r['doc_id'],
-                        "text_preview": r['text'][:150] + "..." if len(r['text']) > 150 else r['text']
-                    }
-                    for r in search_results[:3]
-                ]
-            },
-            "filtered_contexts": {
-                "count": len(contexts),
-                "contexts": [ctx[:200] + "..." if len(ctx) > 200 else ctx for ctx in contexts[:2]]
-            }
-        }
+        return DocumentResponse(answers=answers)
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in debug search: {e}")
-        return {"error": str(e)}
-
-@app.post("/api/v1/hackrx/run", response_model=QueryResponse)
-async def process_query(
-    request: QueryRequest,
-    token: str = Depends(verify_token)
-):
-    """Main endpoint for processing queries - ENHANCED VERSION"""
-    try:
-        start_time = time.time()
-        
-        # Log the document field (ignored as mentioned)
-        if request.documents:
-            logger.info(f"Document field received (ignored): {request.documents[:100]}...")
-        
-        # Quick index check
-        index_stats = pc_index.describe_index_stats()
-        total_vectors = index_stats.total_vector_count
-        
-        logger.info(f"Processing {len(request.questions)} questions")
-        logger.info(f"Index contains {total_vectors} vectors")
-        
-        if total_vectors == 0:
-            return QueryResponse(
-                answers=["The document index is empty. Please index some documents first."] * len(request.questions)
-            )
-        
-        # Enhanced question processing
-        async def process_single_question(question: str) -> str:
-            try:
-                question_start = time.time()
-                logger.info(f"Processing: {question}")
-                
-                # Enhanced search with optimized parameters
-                search_results = await enhanced_search_similar_chunks(question, top_k=15)
-                
-                if not search_results:
-                    return f"No relevant information found for: '{question}'"
-                
-                # Smart context selection
-                contexts = smart_context_selection(search_results, question)
-                
-                if not contexts:
-                    return f"Found potentially related information, but not specific enough for: '{question}'"
-                
-                # Generate enhanced answer
-                answer = await generate_enhanced_answer(question, contexts)
-                
-                question_time = time.time() - question_start
-                logger.info(f"Question processed in {question_time:.2f}s")
-                
-                return answer
-                
-            except Exception as e:
-                logger.error(f"Error processing '{question}': {e}")
-                return f"Error processing: {str(e)}"
-        
-        # Process questions with optimized concurrency
-        semaphore = asyncio.Semaphore(4)  # Slightly increased concurrency
-        
-        async def process_with_semaphore(question: str) -> str:
-            async with semaphore:
-                return await process_single_question(question)
-        
-        # Process all questions
-        tasks = [process_with_semaphore(q) for q in request.questions]
-        answers = await asyncio.gather(*tasks)
-        
-        # Quick cleanup
-        gc.collect()
-        
-        processing_time = time.time() - start_time
-        logger.info(f"TOTAL: Processed {len(request.questions)} questions in {processing_time:.2f}s")
-        
-        return QueryResponse(answers=answers)
-        
-    except Exception as e:
-        logger.error(f"Error in main processing: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/hackrx/run", response_model=QueryResponse)
-async def process_query_api(
-    request: QueryRequest,
-    token: str = Depends(verify_token)
-):
-    """Alternative endpoint path"""
-    return await process_query(request, token)
+        logger.error(f"Unexpected error in /hackrx/run: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while processing your request"
+        )
 
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": "Railway Semantic Search API - Enhanced Version",
-        "version": "2.2.0",
-        "status": "active",
-        "enhancements": "Improved accuracy, smart context selection, enhanced scoring"
+        "message": "HackRX Document Q&A System",
+        "version": "1.0.0",
+        "docs_url": "/docs",
+        "health_url": "/health"
     }
 
-@app.get("/debug")
-async def debug_info():
-    """Debug endpoint"""
-    try:
-        index_stats = pc_index.describe_index_stats()
-        
-        # Test embedding
-        test_embedding = embedding_model.encode(["test"], normalize_embeddings=True)[0]
-        
-        return {
-            "app_status": "running",
-            "version": "2.2.0",
-            "models": {
-                "embedding_loaded": embedding_model is not None,
-                "embedding_dimension": len(test_embedding),
-                "pinecone_connected": pc_index is not None
-            },
-            "index_stats": {
-                "total_vectors": index_stats.total_vector_count,
-                "dimension": index_stats.dimension
-            },
-            "config": {
-                "API_BEARER_TOKEN": "SET" if API_BEARER_TOKEN else "MISSING",
-                "GEMINI_API_KEY": "SET" if GEMINI_API_KEY else "MISSING",
-                "PINECONE_API_KEY": "SET" if PINECONE_API_KEY else "MISSING"
-            }
-        }
-    except Exception as e:
-        return {"error": str(e), "app_status": "error"}
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    executor.shutdown(wait=False)
-
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
-    
-
-
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
+    )
