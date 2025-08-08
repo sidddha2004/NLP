@@ -5,6 +5,7 @@ python-multipart==0.0.6
 aiohttp==3.9.1
 PyPDF2==3.0.1
 sentence-transformers==2.2.2
+huggingface-hub==0.20.3  # ← Critical fix for cached_download error
 pinecone-client==3.0.0
 google-generativeai==0.3.2
 python-dotenv==1.0.0
