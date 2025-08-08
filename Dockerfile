@@ -32,7 +32,7 @@ RUN pip install pinecone-client==3.0.0 google-generativeai==0.3.2
 RUN apk del gcc g++ musl-dev linux-headers
 
 # Copy application
-COPY main-simple.py main.py
+COPY main.py .
 
 # Create user
 RUN addgroup -g 1000 appuser && adduser -D -u 1000 -G appuser appuser
