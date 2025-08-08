@@ -9,8 +9,10 @@ pinecone-client==3.0.0
 google-generativeai==0.3.2
 python-dotenv==1.0.0
 numpy==1.24.3
-torch==2.1.0
+torch==2.1.0+cpu
 transformers==4.35.2
 requests==2.31.0
 Pillow==10.1.0
 typing-extensions==4.8.0
+scikit-learn==1.3.2
+scipy==1.11.4
