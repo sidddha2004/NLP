@@ -33,9 +33,8 @@ RUN pip install sentence-transformers==2.2.2 transformers==4.35.2
 # Install cloud services
 RUN pip install pinecone-client==3.0.0 google-generativeai==0.3.2
 
-# Clean up pip cache and temporary files
-RUN pip cache purge && \
-    find /usr/local -name "*.pyc" -delete && \
+# Clean up temporary files
+RUN find /usr/local -name "*.pyc" -delete && \
     find /usr/local -name "__pycache__" -delete
 
 # Remove build dependencies to save space
