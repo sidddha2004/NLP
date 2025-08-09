@@ -279,12 +279,12 @@ async def retrieve_relevant_chunks_from_pinecone(question: str, doc_hash: str, t
 
 async def generate_answer(question: str, context: str) -> str:
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         # Limit context length
         limited_context = context[:4500] if len(context) > 4500 else context
         
-        prompt = f"""Based on the provided context, answer the question concisely and accurately. If the context doesn't contain enough information to answer the question, say so.
+        prompt = f"""Based on the provided context, answer the question accurately in 1 to 2 lines. Only answer on the basis of context provided strictly.
 
 Context:
 {limited_context}
