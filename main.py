@@ -547,7 +547,7 @@ async def summarize_context_if_needed(context: str, question: str, max_length: i
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
         
-        prompt = f"""Summarize the following context to make it more concise while preserving ALL factual information, numbers, names, dates, and specific details that could be relevant to answering this question: "{question}" """
+        prompt = f"""Summarize the following context to make it more concise while preserving ALL factual information, numbers, names, dates, and specific details that could be relevant to answering this question: "{question}" 
 
 Context to summarize:
 {context[:6000]}
