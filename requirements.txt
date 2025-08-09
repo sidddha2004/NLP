@@ -23,5 +23,5 @@ requests==2.31.0
 
 # Only numpy for basic math operations
 numpy==1.24.4
-
+sentence-transformers
 # Still lightweight! Total size: ~250-350MB
