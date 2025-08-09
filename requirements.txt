@@ -15,10 +15,13 @@ aiohttp==3.9.1
 # Google Gemini API (includes embedding support)
 google-generativeai==0.3.2
 
+# Pinecone vector database
+pinecone-client==3.0.0
+
 # Essential utilities
 requests==2.31.0
 
 # Only numpy for basic math operations
 numpy==1.24.4
 
-# That's it! Total size: ~200-300MB instead of 2-3GB!
+# Still lightweight! Total size: ~250-350MB
