@@ -553,7 +553,7 @@ async def policy_structure_retrieval(question: str, doc_hash: str, seen_chunk_id
 async def validate_answer_completeness(question: str, answer: str, relevant_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Validate if answer addresses all aspects of the question"""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Create context summary from chunks
         context_summary = "\n".join([
