@@ -7,7 +7,7 @@ import io
 import json
 import numpy as np
 import re
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -22,7 +22,7 @@ from pinecone import Pinecone, ServerlessSpec
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="HackRX Document Q&A System with Pinecone", version="1.0.0")
+app = FastAPI(title="HackRX Document Q&A System - Final Optimized Version", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,7 +115,7 @@ async def download_pdf(url: str) -> bytes:
         raise HTTPException(400, f"Network error downloading PDF: {str(e)}")
 
 def clean_text(text: str) -> str:
-    """Clean and normalize extracted text for better processing"""
+    """Advanced text cleaning and normalization"""
     if not text:
         return ""
     
@@ -128,7 +128,10 @@ def clean_text(text: str) -> str:
     text = re.sub(r'([a-z])(\d)', r'\1 \2', text)  # Add space between text and numbers
     text = re.sub(r'(\d)([a-z])', r'\1 \2', text)  # Add space between numbers and text
     
-    # Remove excessive punctuation
+    # Fix broken words from PDF extraction
+    text = re.sub(r'([a-z])-\s+([a-z])', r'\1\2', text)  # Fix hyphenated words
+    
+    # Remove excessive punctuation but preserve important ones
     text = re.sub(r'[^\w\s.,;:!?()-]', ' ', text)
     
     # Final cleanup
@@ -161,68 +164,228 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     except Exception as e:
         raise HTTPException(400, f"Error extracting text from PDF: {str(e)}")
 
-def create_semantic_chunks(text: str, target_chunk_size: int = 1000, min_chunk_size: int = 200) -> List[str]:
-    """Create semantically meaningful chunks that preserve context"""
+def recursive_character_text_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    """Recursive character-based text splitting with hierarchical delimiters"""
     if not text.strip():
         return []
     
-    # First, split by double newlines (paragraphs)
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    # Hierarchical separators in order of preference
+    separators = [
+        "\n\n\n",  # Multiple paragraph breaks
+        "\n\n",    # Paragraph breaks
+        "\n",      # Line breaks
+        ". ",      # Sentence endings
+        "! ",      # Exclamation sentence endings
+        "? ",      # Question sentence endings
+        "; ",      # Semicolons
+        ", ",      # Commas
+        " ",       # Spaces
+        ""         # Character level (last resort)
+    ]
     
-    if not paragraphs:
-        # Fallback to sentence-based chunking
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        paragraphs = [s.strip() for s in sentences if s.strip()]
+    def _split_text_recursive(text: str, separators: List[str]) -> List[str]:
+        final_chunks = []
+        separator = separators[0]
+        new_separators = separators[1:]
+        
+        # Split by current separator
+        splits = text.split(separator)
+        
+        # Rejoin separator (except for empty string separator)
+        if separator != "":
+            splits = [s + separator if i < len(splits) - 1 else s for i, s in enumerate(splits)]
+        
+        good_splits = []
+        for s in splits:
+            if len(s) < chunk_size:
+                good_splits.append(s)
+            else:
+                if good_splits:
+                    # Merge accumulated good splits
+                    merged_text = "".join(good_splits)
+                    final_chunks.extend(_merge_splits(merged_text, chunk_size, chunk_overlap))
+                    good_splits = []
+                
+                # Recursively split the large chunk
+                if new_separators:
+                    final_chunks.extend(_split_text_recursive(s, new_separators))
+                else:
+                    # Last resort: force split by character
+                    final_chunks.extend(_force_split(s, chunk_size, chunk_overlap))
+        
+        # Handle remaining good splits
+        if good_splits:
+            merged_text = "".join(good_splits)
+            final_chunks.extend(_merge_splits(merged_text, chunk_size, chunk_overlap))
+        
+        return final_chunks
     
-    chunks = []
-    current_chunk = ""
-    
-    for paragraph in paragraphs:
-        # If adding this paragraph would exceed target size
-        if len(current_chunk) + len(paragraph) > target_chunk_size:
-            # If current chunk has content, save it
-            if len(current_chunk) >= min_chunk_size:
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
+    def _merge_splits(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """Merge small splits and create overlapping chunks"""
+        if len(text) <= chunk_size:
+            return [text] if text.strip() else []
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
             
-            # If paragraph itself is too long, split it
-            if len(paragraph) > target_chunk_size:
-                sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-                for sentence in sentences:
-                    if len(current_chunk) + len(sentence) > target_chunk_size:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                            current_chunk = sentence
-                        else:
-                            # Even single sentence is too long, force split
-                            words = sentence.split()
-                            for i in range(0, len(words), 150):
-                                chunk_words = words[i:i + 200]
-                                chunks.append(' '.join(chunk_words))
-                    else:
-                        current_chunk += " " + sentence if current_chunk else sentence
+            # If this would be the last chunk and it's small, extend previous chunk
+            if end >= len(text):
+                chunk = text[start:]
+                if len(chunk) > 100 or not chunks:  # Avoid tiny trailing chunks
+                    chunks.append(chunk)
+                else:
+                    # Merge with previous chunk
+                    if chunks:
+                        chunks[-1] += " " + chunk
+                break
             else:
-                current_chunk = paragraph
-        else:
-            current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                chunk = text[start:end]
+                chunks.append(chunk)
+                start = end - chunk_overlap
+        
+        return [chunk.strip() for chunk in chunks if chunk.strip()]
     
-    # Add the last chunk if it has content
-    if len(current_chunk) >= min_chunk_size:
-        chunks.append(current_chunk.strip())
+    def _force_split(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """Force split long text that can't be split by separators"""
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunk = text[start:end]
+            if chunk.strip():
+                chunks.append(chunk.strip())
+            start = end - chunk_overlap
+            
+        return chunks
     
-    # Filter out very small chunks and merge them with adjacent chunks
+    # Start recursive splitting
+    chunks = _split_text_recursive(text, separators)
+    
+    # Filter out very small chunks and clean up
     filtered_chunks = []
-    for i, chunk in enumerate(chunks):
-        if len(chunk) < min_chunk_size and i > 0:
-            # Merge with previous chunk if it won't become too large
-            if len(filtered_chunks[-1]) + len(chunk) < target_chunk_size * 1.5:
-                filtered_chunks[-1] += "\n\n" + chunk
-            else:
-                filtered_chunks.append(chunk)
-        else:
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if len(chunk) >= 100:  # Minimum chunk size
             filtered_chunks.append(chunk)
     
-    return filtered_chunks if filtered_chunks else ([text] if text.strip() else [])
+    return filtered_chunks
+
+def create_sliding_window_chunks(chunks: List[str], window_overlap: int = 150) -> List[str]:
+    """Create sliding window overlaps between chunks to preserve context"""
+    if len(chunks) <= 1:
+        return chunks
+    
+    enhanced_chunks = []
+    
+    for i, chunk in enumerate(chunks):
+        enhanced_chunk = chunk
+        
+        # Add context from previous chunk
+        if i > 0:
+            prev_chunk = chunks[i-1]
+            overlap_text = prev_chunk[-window_overlap:] if len(prev_chunk) > window_overlap else prev_chunk
+            # Find a good break point
+            overlap_words = overlap_text.split()
+            if len(overlap_words) > 10:
+                overlap_text = " ".join(overlap_words[-10:])
+            enhanced_chunk = f"[Previous context: {overlap_text}] {chunk}"
+        
+        # Add context from next chunk
+        if i < len(chunks) - 1:
+            next_chunk = chunks[i+1]
+            preview_text = next_chunk[:window_overlap] if len(next_chunk) > window_overlap else next_chunk
+            # Find a good break point
+            preview_words = preview_text.split()
+            if len(preview_words) > 10:
+                preview_text = " ".join(preview_words[:10])
+            enhanced_chunk = f"{enhanced_chunk} [Next context: {preview_text}]"
+        
+        enhanced_chunks.append(enhanced_chunk)
+    
+    return enhanced_chunks
+
+async def generate_query_variations(question: str) -> List[str]:
+    """Generate multiple variations of a question for better retrieval"""
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        prompt = f"""Generate 2-3 different variations of this question that maintain the same meaning but use different wording and phrasing. This will help find more relevant information in a document.
+
+Original question: {question}
+
+Requirements:
+- Maintain the exact same intent and meaning
+- Use synonyms and alternative phrasings
+- Keep questions concise and clear
+- Focus on the core information being asked
+- Return only the alternative questions, one per line
+
+Alternative questions:"""
+
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=200,
+                temperature=0.7,
+                top_p=0.9
+            )
+        )
+        
+        if response.text:
+            variations = [q.strip() for q in response.text.strip().split('\n') if q.strip()]
+            # Include original question and limit to 3 total variations
+            all_questions = [question] + variations[:2]
+            return all_questions
+        
+    except Exception as e:
+        logger.warning(f"Failed to generate query variations: {e}")
+    
+    return [question]  # Fallback to original question
+
+async def decompose_complex_question(question: str) -> List[str]:
+    """Break down complex questions into simpler sub-questions"""
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        # Check if question is complex enough to decompose
+        question_lower = question.lower()
+        complexity_indicators = ['and', 'or', 'also', 'additionally', 'furthermore', 'moreover', 'what are', 'how does', 'explain']
+        
+        if not any(indicator in question_lower for indicator in complexity_indicators) or len(question.split()) < 8:
+            return [question]
+        
+        prompt = f"""Analyze this question and break it down into 2-3 simpler sub-questions if it's complex. Each sub-question should be answerable independently and together they should cover the original question completely.
+
+Original question: {question}
+
+If the question is simple and doesn't need decomposition, return just the original question.
+If it can be broken down, return the sub-questions, one per line.
+
+Sub-questions:"""
+
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=250,
+                temperature=0.3,
+                top_p=0.8
+            )
+        )
+        
+        if response.text:
+            sub_questions = [q.strip() for q in response.text.strip().split('\n') if q.strip()]
+            return sub_questions[:3] if len(sub_questions) > 1 else [question]
+        
+    except Exception as e:
+        logger.warning(f"Failed to decompose question: {e}")
+    
+    return [question]
 
 async def create_gemini_embedding(text: str, task_type: str = "retrieval_document") -> Optional[List[float]]:
     """Create a single embedding using Gemini API with retry logic"""
@@ -264,9 +427,8 @@ async def create_gemini_embedding(text: str, task_type: str = "retrieval_documen
 async def check_document_exists_in_pinecone(doc_hash: str) -> bool:
     """Check if document already exists in Pinecone"""
     try:
-        # Query for any vector with the document hash prefix
         query_result = index.query(
-            vector=[0.0] * 768,  # Dummy vector for metadata search
+            vector=[0.0] * 768,
             filter={"document_hash": doc_hash},
             top_k=1,
             include_metadata=True
@@ -279,11 +441,10 @@ async def check_document_exists_in_pinecone(doc_hash: str) -> bool:
         return False
 
 async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str) -> bool:
-    """Store document chunks and their embeddings in Pinecone with better metadata"""
+    """Store document chunks with enhanced metadata"""
     try:
         logger.info(f"Processing {len(chunks)} chunks for Pinecone storage")
         
-        # Process chunks in smaller batches to ensure quality
         batch_size = 5
         successful_uploads = 0
         
@@ -291,7 +452,6 @@ async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str)
             batch_chunks = chunks[i:i + batch_size]
             vectors_to_upsert = []
             
-            # Create embeddings for the batch
             for j, chunk in enumerate(batch_chunks):
                 chunk_index = i + j
                 embedding = await create_gemini_embedding(chunk, "retrieval_document")
@@ -308,10 +468,10 @@ async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str)
                         "created_at": datetime.utcnow().isoformat(),
                         "chunk_length": len(chunk),
                         "word_count": len(chunk.split()),
-                        # Add semantic indicators
                         "has_numbers": any(char.isdigit() for char in chunk),
                         "has_questions": '?' in chunk,
-                        "chunk_type": "paragraph" if '\n' in chunk else "sentence"
+                        "has_context_markers": '[Previous context:' in chunk or '[Next context:' in chunk,
+                        "chunk_type": "enhanced" if '[Previous context:' in chunk or '[Next context:' in chunk else "standard"
                     }
                     
                     vectors_to_upsert.append({
@@ -323,10 +483,8 @@ async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str)
                 else:
                     logger.warning(f"Failed to create embedding for chunk {chunk_index}")
                 
-                # Respect API rate limits
                 await asyncio.sleep(0.15)
             
-            # Upsert batch to Pinecone
             if vectors_to_upsert:
                 try:
                     index.upsert(vectors=vectors_to_upsert)
@@ -341,80 +499,100 @@ async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str)
         logger.error(f"Error storing document in Pinecone: {e}")
         return False
 
-async def retrieve_relevant_chunks_from_pinecone(question: str, doc_hash: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Retrieve relevant chunks with enhanced filtering and scoring"""
+async def multi_query_retrieval(questions: List[str], doc_hash: str, top_k: int = 4) -> List[Dict[str, Any]]:
+    """Retrieve relevant chunks using multiple query variations"""
+    all_chunks = []
+    seen_chunk_ids = set()
+    
+    for question in questions:
+        try:
+            question_embedding = await create_gemini_embedding(question, "retrieval_query")
+            
+            if not question_embedding:
+                continue
+            
+            query_result = index.query(
+                vector=question_embedding,
+                filter={"document_hash": doc_hash},
+                top_k=top_k * 2,
+                include_metadata=True
+            )
+            
+            for match in query_result['matches']:
+                chunk_id = match['id']
+                if chunk_id not in seen_chunk_ids and match['metadata'] and 'text' in match['metadata']:
+                    chunk_data = {
+                        'id': chunk_id,
+                        'text': match['metadata']['text'],
+                        'score': match['score'],
+                        'metadata': match['metadata'],
+                        'chunk_index': match['metadata'].get('chunk_index', 0),
+                        'query_source': question
+                    }
+                    all_chunks.append(chunk_data)
+                    seen_chunk_ids.add(chunk_id)
+        
+        except Exception as e:
+            logger.warning(f"Failed to retrieve for query '{question}': {e}")
+    
+    # Sort by score and take top chunks
+    all_chunks.sort(key=lambda x: x['score'], reverse=True)
+    return all_chunks[:top_k]
+
+async def summarize_context_if_needed(context: str, question: str, max_length: int = 4000) -> str:
+    """Summarize context if it's too long while preserving key information"""
+    if len(context) <= max_length:
+        return context
+    
     try:
-        # Create embedding for the question
-        question_embedding = await create_gemini_embedding(question, "retrieval_query")
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
-        if not question_embedding:
-            logger.warning("Failed to create question embedding")
-            return []
-        
-        # Query Pinecone for similar chunks with higher top_k for better selection
-        query_result = index.query(
-            vector=question_embedding,
-            filter={"document_hash": doc_hash},
-            top_k=min(top_k * 2, 15),  # Get more candidates for filtering
-            include_metadata=True
+        prompt = f"""Summarize the following context to make it more concise while preserving ALL factual information, numbers, names, dates, and specific details that could be relevant to answering this question: "{question}" """
+
+Context to summarize:
+{context[:6000]}
+
+Requirements:
+- Keep all specific facts, numbers, names, dates, and technical terms
+- Maintain the logical structure and relationships
+- Remove redundant information and verbose explanations
+- Ensure the summary can still answer the specific question asked
+- Target length: around {max_length} characters
+
+Summarized context:"""
+
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=800,
+                temperature=0.1,
+                top_p=0.8
+            )
         )
         
-        # Process and rank results
-        candidates = []
-        for match in query_result['matches']:
-            if match['metadata'] and 'text' in match['metadata']:
-                chunk_data = {
-                    'text': match['metadata']['text'],
-                    'score': match['score'],
-                    'metadata': match['metadata'],
-                    'chunk_index': match['metadata'].get('chunk_index', 0)
-                }
-                candidates.append(chunk_data)
-        
-        # Enhanced filtering and ranking
-        question_lower = question.lower()
-        
-        # Boost scores based on question relevance
-        for candidate in candidates:
-            text_lower = candidate['text'].lower()
-            
-            # Boost if chunk contains question keywords
-            question_words = set(re.findall(r'\b\w+\b', question_lower))
-            text_words = set(re.findall(r'\b\w+\b', text_lower))
-            overlap = len(question_words.intersection(text_words))
-            keyword_boost = min(overlap * 0.1, 0.3)
-            
-            # Boost for specific question types
-            if '?' in question:
-                if candidate['metadata'].get('has_questions', False):
-                    keyword_boost += 0.1
-            
-            if any(char.isdigit() for char in question):
-                if candidate['metadata'].get('has_numbers', False):
-                    keyword_boost += 0.1
-            
-            # Apply boost
-            candidate['adjusted_score'] = candidate['score'] + keyword_boost
-        
-        # Sort by adjusted score and take top_k
-        candidates.sort(key=lambda x: x['adjusted_score'], reverse=True)
-        selected_candidates = candidates[:top_k]
-        
-        # Ensure chunks are in logical order for context
-        selected_candidates.sort(key=lambda x: x['chunk_index'])
-        
-        logger.info(f"Retrieved {len(selected_candidates)} relevant chunks from Pinecone")
-        for i, candidate in enumerate(selected_candidates):
-            logger.debug(f"Chunk {i+1}: score={candidate['score']:.4f}, adjusted={candidate['adjusted_score']:.4f}")
-        
-        return selected_candidates
+        if response.text and len(response.text.strip()) > 100:
+            return response.text.strip()
         
     except Exception as e:
-        logger.error(f"Error retrieving from Pinecone: {e}")
-        return []
+        logger.warning(f"Context summarization failed: {e}")
+    
+    # Fallback: truncate intelligently
+    sentences = context.split('. ')
+    truncated = []
+    current_length = 0
+    
+    for sentence in sentences:
+        if current_length + len(sentence) <= max_length:
+            truncated.append(sentence)
+            current_length += len(sentence)
+        else:
+            break
+    
+    return '. '.join(truncated)
 
 def analyze_question_type(question: str) -> Dict[str, Any]:
-    """Analyze question to provide better context for answer generation"""
+    """Enhanced question type analysis"""
     question_lower = question.lower().strip()
     
     analysis = {
@@ -425,9 +603,10 @@ def analyze_question_type(question: str) -> Dict[str, Any]:
         'is_when': question_lower.startswith('when'),
         'is_where': question_lower.startswith('where'),
         'is_who': question_lower.startswith('who'),
-        'asks_for_list': any(word in question_lower for word in ['list', 'types', 'kinds', 'categories', 'examples']),
-        'asks_for_number': any(word in question_lower for word in ['how many', 'number of', 'count', 'quantity']),
-        'asks_for_definition': any(word in question_lower for word in ['define', 'definition', 'meaning', 'what is', 'what are'])
+        'asks_for_list': any(word in question_lower for word in ['list', 'types', 'kinds', 'categories', 'examples', 'what are']),
+        'asks_for_number': any(word in question_lower for word in ['how many', 'number of', 'count', 'quantity', 'amount']),
+        'asks_for_definition': any(word in question_lower for word in ['define', 'definition', 'meaning', 'what is', 'what are']),
+        'is_complex': len(question.split()) > 12 or any(word in question_lower for word in ['and', 'or', 'also', 'additionally'])
     }
     
     return analysis
@@ -439,56 +618,50 @@ async def generate_answer(question: str, relevant_chunks: List[Dict[str, Any]]) 
         
         model = genai.GenerativeModel('gemini-2.5-flash')
         
-        # Analyze question type for better prompting
+        # Analyze question for better prompting
         question_analysis = analyze_question_type(question)
         
         # Prepare context from chunks
         context_parts = []
         for i, chunk_data in enumerate(relevant_chunks):
-            context_parts.append(f"[Context {i+1}]: {chunk_data['text']}")
+            text = chunk_data['text']
+            # Remove context markers for cleaner presentation
+            text = re.sub(r'\[Previous context:.*?\]', '', text)
+            text = re.sub(r'\[Next context:.*?\]', '', text)
+            text = text.strip()
+            context_parts.append(f"[Section {i+1}]: {text}")
         
         context = "\n\n".join(context_parts)
         
-        # Limit context length but preserve important information
-        if len(context) > 5000:
-            # Prioritize highest scoring chunks
-            sorted_chunks = sorted(relevant_chunks, key=lambda x: x.get('adjusted_score', x['score']), reverse=True)
-            priority_context = []
-            current_length = 0
-            
-            for chunk_data in sorted_chunks:
-                chunk_text = f"[Context]: {chunk_data['text']}"
-                if current_length + len(chunk_text) <= 4500:
-                    priority_context.append(chunk_text)
-                    current_length += len(chunk_text)
-                else:
-                    break
-            
-            context = "\n\n".join(priority_context)
+        # Summarize context if too long
+        context = await summarize_context_if_needed(context, question, 4500)
         
-        # Build dynamic prompt based on question type
-        base_rules = """You are an expert assistant providing precise answers based solely on the provided document context.
+        # Enhanced prompting based on question type
+        base_rules = """You are an expert document analyst providing precise answers based solely on the provided document sections.
 
 CRITICAL RULES:
-1. Use ONLY the provided context to answer - never add external knowledge
-2. If the answer is not in the context, respond exactly: "The document does not provide this information."
+1. Use ONLY the provided sections to answer - never add external knowledge
+2. If the answer is not in the sections, respond exactly: "The document does not provide this information."
 3. Never make assumptions, add examples, or guess missing details
-4. Preserve exact terminology, numbers, and conditions from the context
-5. Be precise and factual - avoid generalizations"""
+4. Preserve exact terminology, numbers, and conditions from the sections
+5. Be precise and factual - avoid generalizations
+6. Always maintain the original meaning and context from the document"""
 
         question_specific_guidance = ""
         if question_analysis['is_yes_no']:
-            question_specific_guidance = "\n6. For Yes/No questions: Start with 'Yes' or 'No', then provide supporting details from the context."
+            question_specific_guidance = "\n7. For Yes/No questions: Start with 'Yes' or 'No', then provide supporting details from the sections."
         elif question_analysis['asks_for_list']:
-            question_specific_guidance = "\n6. For list questions: Provide items exactly as mentioned in the context, maintaining original order and terminology."
+            question_specific_guidance = "\n7. For list questions: Provide items exactly as mentioned, maintaining original order and terminology."
         elif question_analysis['asks_for_number']:
-            question_specific_guidance = "\n6. For numerical questions: Provide exact numbers from the context. If ranges or approximations are given, state them precisely."
+            question_specific_guidance = "\n7. For numerical questions: Provide exact numbers from the sections. If ranges or approximations are given, state them precisely."
         elif question_analysis['asks_for_definition']:
-            question_specific_guidance = "\n6. For definition questions: Use the exact wording and explanation provided in the context."
-        
+            question_specific_guidance = "\n7. For definition questions: Use the exact wording and explanation provided in the sections."
+        elif question_analysis['is_complex']:
+            question_specific_guidance = "\n7. For complex questions: Address each part systematically using information from the sections."
+
         prompt = f"""{base_rules}{question_specific_guidance}
 
-Context from document:
+Document sections:
 {context}
 
 Question: {question}
@@ -500,13 +673,13 @@ Answer:"""
                 model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=500,
-                    temperature=0.1,  # Lower temperature for more consistent answers
+                    max_output_tokens=600,
+                    temperature=0.1,
                     top_p=0.9,
                     top_k=20
                 )
             ),
-            timeout=30.0
+            timeout=35.0
         )
         
         answer = response.text.strip() if response.text else "No answer generated."
@@ -539,25 +712,32 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             pdf_content = await download_pdf(str(url))
             text = extract_text_from_pdf(pdf_content)
             
-            # Use improved chunking strategy
-            chunks = create_semantic_chunks(text, target_chunk_size=900, min_chunk_size=200)
+            # Use recursive character text splitting
+            base_chunks = recursive_character_text_split(text, chunk_size=900, chunk_overlap=150)
             
-            if not chunks:
+            if not base_chunks:
                 raise HTTPException(400, "No text chunks could be created from the PDF")
             
-            # Limit number of chunks but ensure we get the most important ones
-            if len(chunks) > 80:
-                # Keep first chunks (usually intro/summary) and distribute the rest
-                important_chunks = chunks[:20] + chunks[20::max(1, (len(chunks)-20)//40)][:60]
-                chunks = important_chunks
+            # Apply sliding window chunking for better context preservation
+            enhanced_chunks = create_sliding_window_chunks(base_chunks, window_overlap=100)
+            
+            # Limit chunks but ensure quality
+            if len(enhanced_chunks) > 70:
+                # Keep important chunks: first 15 (intro), last 10 (conclusion), and distribute middle
+                important_chunks = (
+                    enhanced_chunks[:15] + 
+                    enhanced_chunks[15::max(1, (len(enhanced_chunks)-25)//45)][:45] + 
+                    enhanced_chunks[-10:]
+                )
+                enhanced_chunks = important_chunks
             
             # Store in Pinecone
-            success = await store_document_in_pinecone(doc_hash, chunks, str(url))
+            success = await store_document_in_pinecone(doc_hash, enhanced_chunks, str(url))
             
             if not success:
                 raise HTTPException(500, "Failed to store document in Pinecone")
                 
-            logger.info(f"Document successfully processed and stored in Pinecone. Total chunks: {len(chunks)}")
+            logger.info(f"Document successfully processed and stored. Base chunks: {len(base_chunks)}, Enhanced chunks: {len(enhanced_chunks)}")
             
         except Exception as e:
             logger.error(f"Error processing document: {e}")
@@ -565,15 +745,38 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
     else:
         logger.info("Document found in Pinecone, using existing data")
     
-    # Process questions using enhanced retrieval
+    # Process questions with enhanced strategies
     async def process_single_question(question: str) -> str:
         try:
-            # Retrieve relevant chunks from Pinecone
-            relevant_chunks = await retrieve_relevant_chunks_from_pinecone(question, doc_hash, top_k=4)
+            # Step 1: Question decomposition for complex questions
+            sub_questions = await decompose_complex_question(question)
+            logger.info(f"Question decomposed into {len(sub_questions)} parts: {sub_questions}")
+            
+            # Step 2: Generate query variations for better retrieval
+            all_queries = []
+            for sub_q in sub_questions:
+                variations = await generate_query_variations(sub_q)
+                all_queries.extend(variations)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_queries = []
+            for q in all_queries:
+                if q.lower() not in seen:
+                    unique_queries.append(q)
+                    seen.add(q.lower())
+            
+            # Limit to most relevant queries
+            unique_queries = unique_queries[:6]
+            logger.info(f"Using {len(unique_queries)} unique queries for retrieval")
+            
+            # Step 3: Multi-query retrieval
+            relevant_chunks = await multi_query_retrieval(unique_queries, doc_hash, top_k=5)
             
             if not relevant_chunks:
                 return "No relevant information found in the document."
             
+            # Step 4: Generate answer with enhanced context
             answer = await generate_answer(question, relevant_chunks)
             return answer
             
@@ -582,7 +785,7 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             return "An error occurred while processing this question."
     
     # Process questions with controlled concurrency
-    semaphore = asyncio.Semaphore(2)  # Reduced for better accuracy
+    semaphore = asyncio.Semaphore(2)
     
     async def process_with_semaphore(question: str) -> str:
         async with semaphore:
@@ -619,9 +822,15 @@ async def health_check():
             "gemini_configured": bool(GEMINI_API_KEY),
             "pinecone_status": pinecone_status,
             "pinecone_index": PINECONE_INDEX_NAME,
-            "embedding_method": "gemini_api",
-            "vector_database": "pinecone",
-            "optimization_features": ["semantic_chunking", "enhanced_retrieval", "question_analysis", "improved_prompts"]
+            "version": "2.0.0",
+            "optimization_features": [
+                "recursive_character_text_splitting",
+                "sliding_window_chunking", 
+                "multi_query_retrieval",
+                "question_decomposition",
+                "context_summarization",
+                "enhanced_prompting"
+            ]
         }
     except Exception as e:
         raise HTTPException(500, f"Health check failed: {str(e)}")
@@ -629,12 +838,33 @@ async def health_check():
 @app.get("/")
 async def root():
     return {
-        "message": "HackRX Document Q&A System with Pinecone Vector Database - Optimized for Accuracy",
-        "version": "1.0.0",
+        "message": "HackRX Document Q&A System - Final Optimized Version with Advanced Accuracy Features",
+        "version": "2.0.0",
         "status": "running",
-        "features": ["pinecone_storage", "gemini_embeddings", "gemini_qa", "pdf_processing"],
-        "optimizations": ["semantic_chunking", "enhanced_text_cleaning", "question_type_analysis", "improved_retrieval", "better_prompting"],
-        "advantages": ["persistent_storage", "fast_retrieval", "scalable", "cost_effective", "high_accuracy"]
+        "features": [
+            "pinecone_storage", 
+            "gemini_embeddings", 
+            "gemini_qa", 
+            "pdf_processing"
+        ],
+        "accuracy_optimizations": [
+            "recursive_character_text_splitting",
+            "sliding_window_chunking",
+            "multi_query_retrieval", 
+            "question_decomposition",
+            "context_summarization",
+            "enhanced_question_analysis",
+            "improved_prompting_strategies"
+        ],
+        "advantages": [
+            "persistent_storage", 
+            "fast_retrieval", 
+            "scalable", 
+            "cost_effective", 
+            "high_accuracy",
+            "context_preservation",
+            "intelligent_chunking"
+        ]
     }
 
 @app.post("/hackrx/run", response_model=DocumentResponse)
@@ -648,10 +878,10 @@ async def process_document_qa(
         
         answers = await asyncio.wait_for(
             process_document_and_questions(request.documents, request.questions),
-            timeout=300.0
+            timeout=400.0  # Increased timeout for enhanced processing
         )
         
-        logger.info(f"Successfully processed {len(answers)} answers")
+        logger.info(f"Successfully processed {len(answers)} answers with advanced optimization")
         return DocumentResponse(answers=answers)
         
     except HTTPException:
@@ -663,22 +893,24 @@ async def process_document_qa(
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
 
-# Additional endpoint to check document status
+# Enhanced document status endpoint
 @app.get("/document-status/{doc_hash}")
 async def get_document_status(doc_hash: str, token: str = Depends(verify_token)):
     try:
         exists = await check_document_exists_in_pinecone(doc_hash)
         
         if exists:
-            # Get document stats from Pinecone
+            # Get comprehensive document stats
             query_result = index.query(
                 vector=[0.0] * 768,
                 filter={"document_hash": doc_hash},
-                top_k=100,  # Get more to count total chunks
+                top_k=100,
                 include_metadata=True
             )
             
             chunk_count = len(query_result['matches'])
+            enhanced_chunks = 0
+            standard_chunks = 0
             creation_date = None
             url = None
             
@@ -687,14 +919,29 @@ async def get_document_status(doc_hash: str, token: str = Depends(verify_token))
                 if first_match['metadata']:
                     creation_date = first_match['metadata'].get('created_at')
                     url = first_match['metadata'].get('url')
+                
+                # Count chunk types
+                for match in query_result['matches']:
+                    if match['metadata'].get('chunk_type') == 'enhanced':
+                        enhanced_chunks += 1
+                    else:
+                        standard_chunks += 1
             
             return {
                 "document_hash": doc_hash,
                 "exists": True,
-                "chunk_count": chunk_count,
+                "total_chunks": chunk_count,
+                "enhanced_chunks": enhanced_chunks,
+                "standard_chunks": standard_chunks,
                 "created_at": creation_date,
                 "url": url,
-                "optimization_level": "enhanced"
+                "optimization_level": "advanced_v2.0",
+                "features_enabled": [
+                    "recursive_splitting",
+                    "sliding_windows", 
+                    "multi_query_retrieval",
+                    "context_preservation"
+                ]
             }
         else:
             return {
@@ -705,7 +952,7 @@ async def get_document_status(doc_hash: str, token: str = Depends(verify_token))
     except Exception as e:
         raise HTTPException(500, f"Error checking document status: {str(e)}")
 
-# Endpoint to delete document from Pinecone (optional)
+# Endpoint to delete document from Pinecone
 @app.delete("/document/{doc_hash}")
 async def delete_document(doc_hash: str, token: str = Depends(verify_token)):
     try:
@@ -720,17 +967,38 @@ async def delete_document(doc_hash: str, token: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(500, f"Error deleting document: {str(e)}")
 
+# New endpoint to test query variations (for debugging)
+@app.post("/debug/query-variations")
+async def debug_query_variations(
+    question: str,
+    token: str = Depends(verify_token)
+):
+    try:
+        variations = await generate_query_variations(question)
+        decomposed = await decompose_complex_question(question)
+        analysis = analyze_question_type(question)
+        
+        return {
+            "original_question": question,
+            "query_variations": variations,
+            "decomposed_questions": decomposed,
+            "question_analysis": analysis
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error in debug endpoint: {str(e)}")
+
 @app.on_event("startup")
 async def startup():
-    logger.info("Application starting up...")
-    logger.info("Using Gemini API for embeddings + Pinecone for storage")
+    logger.info("HackRX Document Q&A System v2.0 starting up...")
+    logger.info("Advanced Features: Recursive Text Splitting + Multi-Query Retrieval + Context Optimization")
     logger.info(f"Pinecone index: {PINECONE_INDEX_NAME}")
-    logger.info("Optimizations enabled: semantic chunking, enhanced retrieval, question analysis")
-    logger.info("Startup completed successfully")
+    logger.info("All optimization strategies loaded successfully")
+    logger.info("System ready for high-accuracy document Q&A processing")
 
 @app.on_event("shutdown")
 async def shutdown():
-    logger.info("Application shutting down...")
+    logger.info("HackRX Document Q&A System v2.0 shutting down...")
     logger.info("Shutdown completed")
 
 if __name__ == "__main__":
