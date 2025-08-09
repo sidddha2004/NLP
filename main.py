@@ -64,8 +64,8 @@ try:
             dimension=768,  # Gemini embedding dimension
             metric='cosine',
             spec=ServerlessSpec(
-                cloud='gcp',
-                region='us-central1'
+                cloud='aws',
+                region='us-east-1'
             )
         )
         # Wait for index to be ready
