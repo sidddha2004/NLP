@@ -1,29 +1,26 @@
-# Core FastAPI and async dependencies
+# Core FastAPI
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
-
-# Authentication
 python-multipart==0.0.6
 
-# PDF processing (lightweight)
+# PDF processing
 PyPDF2==3.0.1
 
 # HTTP client
 aiohttp==3.9.1
-
-# Google Gemini API (includes embedding support)
-google-generativeai==0.3.2
-
-# Pinecone vector database
-pinecone-client==3.0.0
-
-# Essential utilities
 requests==2.31.0
 
-# Only numpy for basic math operations
-numpy==1.24.4
-sentence-transformers==3.0.1
-torch>=2.0.0 --extra-index-url https://download.pytorch.org/whl/cpu
-numpy
+# Google Gemini API
+google-generativeai==0.3.2
 
+# Pinecone vector DB
+pinecone-client==3.0.0
+
+# SentenceTransformers (with CPU-only torch)
+sentence-transformers==3.0.1
+torch==2.2.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Numpy only for math ops
+numpy==1.24.4
