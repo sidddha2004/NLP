@@ -340,6 +340,13 @@ Semantic variations:"""
         )
         
         if response.text:
+            variations = [q.strip() for q in response.text.strip().split('\n') if q.strip()]
+            return variations[:5]  # Limit to top 5 variations
+        
+    except Exception as e:
+        logger.warning(f"Semantic query expansion failed: {e}")
+    
+    return [question]
 
 # PHASE 1 ENHANCEMENT: POLICY-SPECIFIC CONTEXT UNDERSTANDING
 INSURANCE_TERMINOLOGY_MAP = {
@@ -385,13 +392,19 @@ def expand_insurance_query(question: str) -> List[str]:
     return list(set(expanded_queries))
 
 # PHASE 1 ENHANCEMENT: HYBRID RETRIEVAL STRATEGY  
-async def hybrid_retrieval(question: str, doc_hash: str, top_k: int = 6) -> List[Dict[str, Any]]:
+async def hybrid_retrieval(questions: List[str], doc_hash: str, top_k: int = 6) -> List[Dict[str, Any]]:
     """Combine vector similarity with keyword-based retrieval"""
     all_chunks = []
     seen_chunk_ids = set()
     
+    # Handle both single question string and list of questions
+    if isinstance(questions, str):
+        questions = [questions]
+    
     # Step 1: Get expanded queries with insurance terminology
-    expanded_queries = expand_insurance_query(question)
+    expanded_queries = []
+    for question in questions:
+        expanded_queries.extend(expand_insurance_query(question))
     
     # Step 2: Vector-based retrieval (existing semantic approach)
     semantic_chunks = await multi_query_retrieval(expanded_queries, doc_hash, top_k)
@@ -402,12 +415,14 @@ async def hybrid_retrieval(question: str, doc_hash: str, top_k: int = 6) -> List
             seen_chunk_ids.add(chunk['id'])
     
     # Step 3: Keyword-based fallback retrieval
-    keyword_chunks = await keyword_fallback_retrieval(question, doc_hash, seen_chunk_ids, top_k)
-    all_chunks.extend(keyword_chunks)
+    for question in questions:
+        keyword_chunks = await keyword_fallback_retrieval(question, doc_hash, seen_chunk_ids, top_k)
+        all_chunks.extend(keyword_chunks)
     
     # Step 4: Policy structure-aware retrieval
-    structure_chunks = await policy_structure_retrieval(question, doc_hash, seen_chunk_ids, top_k//2)
-    all_chunks.extend(structure_chunks)
+    for question in questions:
+        structure_chunks = await policy_structure_retrieval(question, doc_hash, seen_chunk_ids, top_k//2)
+        all_chunks.extend(structure_chunks)
     
     # Sort by combined relevance score
     all_chunks.sort(key=lambda x: x['score'], reverse=True)
@@ -533,6 +548,7 @@ async def policy_structure_retrieval(question: str, doc_hash: str, seen_chunk_id
     except Exception as e:
         logger.warning(f"Policy structure retrieval failed: {e}")
         return []
+
 # PHASE 1 ENHANCEMENT: ANSWER COMPLETENESS VALIDATION
 async def validate_answer_completeness(question: str, answer: str, relevant_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Validate if answer addresses all aspects of the question"""
@@ -688,6 +704,8 @@ Comprehensive Answer:"""
         logger.warning(f"Answer refinement failed: {e}")
     
     return initial_answer
+
+def extract_named_entities(text: str) -> Dict[str, List[str]]:
     """Extract named entities using regex patterns"""
     entities = {
         'people': [],
