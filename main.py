@@ -6,7 +6,7 @@ import aiohttp
 import io
 import json
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -16,11 +16,12 @@ from pydantic import BaseModel, HttpUrl, Field
 
 import PyPDF2
 import google.generativeai as genai
+from pinecone import Pinecone, ServerlessSpec
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="HackRX Document Q&A System", version="1.0.0")
+app = FastAPI(title="HackRX Document Q&A System with Pinecone", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,18 +33,51 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# In-memory storage for documents and embeddings
-document_store: Dict[str, Dict] = {}
-MAX_DOCUMENTS = 20  # Good balance for memory
-
 # Environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN", "default_token")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx-documents")
 
+# Validate required environment variables
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY environment variable")
+if not PINECONE_API_KEY:
+    raise ValueError("Missing PINECONE_API_KEY environment variable")
 
+# Initialize services
 genai.configure(api_key=GEMINI_API_KEY)
+
+# Initialize Pinecone
+pc = None
+index = None
+try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    # Check if index exists, create if not
+    existing_indexes = pc.list_indexes().names()
+    if PINECONE_INDEX_NAME not in existing_indexes:
+        logger.info(f"Creating Pinecone index: {PINECONE_INDEX_NAME}")
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=768,  # Gemini embedding dimension
+            metric='cosine',
+            spec=ServerlessSpec(
+                cloud='gcp',
+                region='us-central1'
+            )
+        )
+        # Wait for index to be ready
+        import time
+        time.sleep(10)
+    
+    index = pc.Index(PINECONE_INDEX_NAME)
+    logger.info("Pinecone initialized successfully")
+    
+except Exception as e:
+    logger.error(f"Failed to initialize Pinecone: {e}")
+    raise ValueError(f"Pinecone initialization failed: {e}")
 
 class DocumentRequest(BaseModel):
     documents: HttpUrl = Field(..., description="URL of the PDF document")
@@ -58,7 +92,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return credentials.credentials
 
 def generate_document_hash(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
+    """Generate a consistent hash for document URL"""
+    return hashlib.sha256(url.encode()).hexdigest()
+
+def generate_chunk_id(doc_hash: str, chunk_index: int) -> str:
+    """Generate unique ID for each chunk"""
+    return f"{doc_hash}_chunk_{chunk_index}"
 
 async def download_pdf(url: str) -> bytes:
     timeout = aiohttp.ClientTimeout(total=60)
@@ -78,7 +117,7 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     try:
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
         text_parts = []
-        max_pages = min(40, len(pdf_reader.pages))  # Good balance
+        max_pages = min(50, len(pdf_reader.pages))
         
         for page_num in range(max_pages):
             try:
@@ -116,160 +155,127 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
     
     return chunks if chunks else ([text] if text.strip() else [])
 
-async def create_gemini_embeddings(texts: List[str]) -> Optional[List[List[float]]]:
-    """Create embeddings using Gemini's embedding API"""
+async def create_gemini_embedding(text: str, task_type: str = "retrieval_document") -> Optional[List[float]]:
+    """Create a single embedding using Gemini API"""
     try:
-        # Process in batches to avoid API limits
-        batch_size = 10  # Gemini embedding API batch limit
-        all_embeddings = []
+        result = await asyncio.to_thread(
+            genai.embed_content,
+            model="models/embedding-001",
+            content=text,
+            task_type=task_type
+        )
         
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+        # Extract embedding from result
+        if hasattr(result, 'embedding'):
+            return result.embedding
+        elif isinstance(result, dict) and 'embedding' in result:
+            return result['embedding']
+        else:
+            logger.warning(f"Unexpected embedding result format: {type(result)}")
+            return None
             
-            try:
-                # Use Gemini's embedding model
-                result = await asyncio.to_thread(
-                    genai.embed_content,
-                    model="models/embedding-001",  # Gemini's embedding model
-                    content=batch,
-                    task_type="retrieval_document"  # Optimized for document retrieval
-                )
+    except Exception as e:
+        logger.error(f"Error creating Gemini embedding: {e}")
+        return None
+
+async def check_document_exists_in_pinecone(doc_hash: str) -> bool:
+    """Check if document already exists in Pinecone"""
+    try:
+        # Query for any vector with the document hash prefix
+        query_result = index.query(
+            vector=[0.0] * 768,  # Dummy vector for metadata search
+            filter={"document_hash": doc_hash},
+            top_k=1,
+            include_metadata=True
+        )
+        
+        return len(query_result['matches']) > 0
+        
+    except Exception as e:
+        logger.error(f"Error checking document existence in Pinecone: {e}")
+        return False
+
+async def store_document_in_pinecone(doc_hash: str, chunks: List[str], url: str) -> bool:
+    """Store document chunks and their embeddings in Pinecone"""
+    try:
+        logger.info(f"Processing {len(chunks)} chunks for Pinecone storage")
+        
+        # Process chunks in batches
+        batch_size = 10
+        vectors_to_upsert = []
+        
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            
+            # Create embeddings for the batch
+            for j, chunk in enumerate(batch_chunks):
+                chunk_index = i + j
+                embedding = await create_gemini_embedding(chunk, "retrieval_document")
                 
-                # Extract embeddings from result
-                if hasattr(result, 'embedding'):
-                    # Single embedding
-                    all_embeddings.append(result['embedding'])
-                elif hasattr(result, 'embeddings'):
-                    # Multiple embeddings
-                    all_embeddings.extend(result['embeddings'])
-                else:
-                    # Handle different response formats
-                    batch_embeddings = result if isinstance(result, list) else [result]
-                    all_embeddings.extend(batch_embeddings)
+                if embedding:
+                    vector_id = generate_chunk_id(doc_hash, chunk_index)
+                    metadata = {
+                        "document_hash": doc_hash,
+                        "chunk_index": chunk_index,
+                        "text": chunk,
+                        "url": url,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    
+                    vectors_to_upsert.append({
+                        "id": vector_id,
+                        "values": embedding,
+                        "metadata": metadata
+                    })
                 
                 # Small delay to respect API limits
                 await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                logger.warning(f"Failed to create embeddings for batch {i//batch_size + 1}: {e}")
-                # Continue with other batches
-                continue
-        
-        if not all_embeddings:
-            return None
             
-        logger.info(f"Created {len(all_embeddings)} embeddings using Gemini API")
-        return all_embeddings
+            # Upsert batch to Pinecone
+            if vectors_to_upsert:
+                index.upsert(vectors=vectors_to_upsert[-len(batch_chunks):])
+                logger.info(f"Upserted batch {(i//batch_size) + 1} to Pinecone")
+        
+        logger.info(f"Successfully stored {len(vectors_to_upsert)} chunks in Pinecone for document {doc_hash}")
+        return True
         
     except Exception as e:
-        logger.error(f"Error creating Gemini embeddings: {e}")
-        return None
+        logger.error(f"Error storing document in Pinecone: {e}")
+        return False
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Calculate cosine similarity between two vectors"""
+async def retrieve_relevant_chunks_from_pinecone(question: str, doc_hash: str, top_k: int = 3) -> List[str]:
+    """Retrieve relevant chunks from Pinecone using question embedding"""
     try:
-        # Convert to numpy arrays for easier computation
-        vec_a = np.array(a, dtype=np.float32)
-        vec_b = np.array(b, dtype=np.float32)
+        # Create embedding for the question
+        question_embedding = await create_gemini_embedding(question, "retrieval_query")
         
-        # Calculate cosine similarity
-        dot_product = np.dot(vec_a, vec_b)
-        norm_a = np.linalg.norm(vec_a)
-        norm_b = np.linalg.norm(vec_b)
+        if not question_embedding:
+            logger.warning("Failed to create question embedding, using fallback")
+            return []
         
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-            
-        return float(dot_product / (norm_a * norm_b))
-        
-    except Exception as e:
-        logger.error(f"Error calculating cosine similarity: {e}")
-        return 0.0
-
-async def get_relevant_chunks_with_gemini_embeddings(question: str, chunks: List[str], embeddings: List[List[float]], top_k: int = 3) -> List[str]:
-    """Use Gemini embeddings for semantic similarity"""
-    if not embeddings or len(chunks) == 0:
-        return chunks[:top_k]
-    
-    try:
-        # Create embedding for the question using Gemini
-        question_result = await asyncio.to_thread(
-            genai.embed_content,
-            model="models/embedding-001",
-            content=[question],
-            task_type="retrieval_query"  # Optimized for queries
+        # Query Pinecone for similar chunks
+        query_result = index.query(
+            vector=question_embedding,
+            filter={"document_hash": doc_hash},
+            top_k=top_k,
+            include_metadata=True
         )
         
-        # Extract question embedding
-        if hasattr(question_result, 'embedding'):
-            question_embedding = question_result.embedding
-        elif hasattr(question_result, 'embeddings'):
-            question_embedding = question_result.embeddings[0]
-        else:
-            question_embedding = question_result[0] if isinstance(question_result, list) else question_result
+        # Extract relevant chunks
+        relevant_chunks = []
+        for match in query_result['matches']:
+            if match['metadata'] and 'text' in match['metadata']:
+                chunk_text = match['metadata']['text']
+                score = match['score']
+                relevant_chunks.append(chunk_text)
+                logger.debug(f"Retrieved chunk with similarity score: {score:.4f}")
         
-        # Calculate similarities with all chunk embeddings
-        similarities = []
-        for i, chunk_embedding in enumerate(embeddings):
-            if i < len(chunks):  # Ensure we don't go out of bounds
-                similarity = cosine_similarity(question_embedding, chunk_embedding)
-                similarities.append((similarity, i))
-        
-        # Sort by similarity and get top chunks
-        similarities.sort(reverse=True, key=lambda x: x[0])
-        top_indices = [idx for _, idx in similarities[:top_k]]
-        
-        relevant_chunks = [chunks[i] for i in top_indices if i < len(chunks)]
-        similarity_scores = [score for score, _ in similarities[:len(relevant_chunks)]]
-        
-        logger.info(f"Selected {len(relevant_chunks)} relevant chunks with Gemini embeddings, similarities: {similarity_scores}")
+        logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks from Pinecone")
         return relevant_chunks
         
     except Exception as e:
-        logger.error(f"Error in Gemini embedding similarity search: {e}")
-        # Fallback to keyword-based matching
-        return await get_relevant_chunks_keyword_fallback(question, chunks, top_k)
-
-async def get_relevant_chunks_keyword_fallback(question: str, chunks: List[str], top_k: int = 3) -> List[str]:
-    """Fallback method using keyword matching"""
-    if not chunks:
+        logger.error(f"Error retrieving from Pinecone: {e}")
         return []
-    
-    if len(chunks) <= top_k:
-        return chunks
-    
-    try:
-        # Simple but effective keyword-based relevance scoring
-        question_words = set(word.lower().strip('.,!?":;()[]{}') for word in question.split() if len(word) > 2)
-        chunk_scores = []
-        
-        for i, chunk in enumerate(chunks):
-            chunk_words = set(word.lower().strip('.,!?":;()[]{}') for word in chunk.split() if len(word) > 2)
-            
-            # Calculate relevance score
-            common_words = question_words.intersection(chunk_words)
-            score = len(common_words)
-            
-            # Boost score for exact phrase matches
-            question_lower = question.lower()
-            chunk_lower = chunk.lower()
-            for word in question_words:
-                if word in chunk_lower:
-                    score += 0.5
-            
-            chunk_scores.append((score, i))
-        
-        # Sort by score and return top chunks
-        chunk_scores.sort(reverse=True, key=lambda x: x[0])
-        relevant_indices = [idx for _, idx in chunk_scores[:top_k]]
-        relevant_chunks = [chunks[i] for i in relevant_indices]
-        
-        logger.info(f"Selected {len(relevant_chunks)} relevant chunks using keyword fallback")
-        return relevant_chunks
-        
-    except Exception as e:
-        logger.error(f"Error in keyword fallback: {e}")
-        return chunks[:top_k]
 
 async def generate_answer(question: str, context: str) -> str:
     try:
@@ -311,18 +317,16 @@ Answer:"""
 
 async def process_document_and_questions(url: str, questions: List[str]) -> List[str]:
     doc_hash = generate_document_hash(str(url))
+    logger.info(f"Processing document with hash: {doc_hash}")
     
-    # Clean up old documents if we're at capacity
-    if len(document_store) >= MAX_DOCUMENTS and doc_hash not in document_store:
-        # Remove oldest document
-        oldest_doc = min(document_store.items(), key=lambda x: x[1]['processed_at'])
-        del document_store[oldest_doc[0]]
-        logger.info(f"Removed oldest document to free memory")
+    # Check if document exists in Pinecone
+    document_exists = await check_document_exists_in_pinecone(doc_hash)
     
-    # Check if document is already processed
-    if doc_hash not in document_store:
-        logger.info(f"Processing new document: {doc_hash}")
+    if not document_exists:
+        logger.info("Document not found in Pinecone, processing and storing...")
+        
         try:
+            # Download and process the document
             pdf_content = await download_pdf(str(url))
             text = extract_text_from_pdf(pdf_content)
             chunks = chunk_text(text)
@@ -330,40 +334,28 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             if not chunks:
                 raise HTTPException(400, "No text chunks could be created from the PDF")
             
-            # Limit number of chunks to manage API usage
-            chunks = chunks[:60]  # Reasonable limit
+            # Limit number of chunks for efficiency
+            chunks = chunks[:60]
             
-            # Create embeddings using Gemini API
-            embeddings = await create_gemini_embeddings(chunks)
+            # Store in Pinecone
+            success = await store_document_in_pinecone(doc_hash, chunks, str(url))
             
-            # Store in memory
-            document_store[doc_hash] = {
-                'chunks': chunks,
-                'embeddings': embeddings,
-                'url': str(url),
-                'processed_at': datetime.utcnow().isoformat()
-            }
-            
-            embed_status = "with Gemini embeddings" if embeddings else "without embeddings (will use keyword matching)"
-            logger.info(f"Document processed successfully. Chunks: {len(chunks)} {embed_status}")
+            if not success:
+                raise HTTPException(500, "Failed to store document in Pinecone")
+                
+            logger.info(f"Document successfully processed and stored in Pinecone. Total chunks: {len(chunks)}")
             
         except Exception as e:
             logger.error(f"Error processing document: {e}")
             raise
     else:
-        logger.info(f"Using cached document: {doc_hash}")
+        logger.info("Document found in Pinecone, using existing data")
     
-    document_data = document_store[doc_hash]
-    chunks = document_data['chunks']
-    embeddings = document_data.get('embeddings')
-    
+    # Process questions using Pinecone retrieval
     async def process_single_question(question: str) -> str:
         try:
-            # Try Gemini embeddings first, fallback to keyword matching
-            if embeddings:
-                relevant_chunks = await get_relevant_chunks_with_gemini_embeddings(question, chunks, embeddings, top_k=3)
-            else:
-                relevant_chunks = await get_relevant_chunks_keyword_fallback(question, chunks, top_k=3)
+            # Retrieve relevant chunks from Pinecone
+            relevant_chunks = await retrieve_relevant_chunks_from_pinecone(question, doc_hash, top_k=3)
             
             if not relevant_chunks:
                 return "No relevant information found in the document."
@@ -377,13 +369,13 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             return "An error occurred while processing this question."
     
     # Process questions with controlled concurrency
-    semaphore = asyncio.Semaphore(3)  # Allow 3 concurrent questions
+    semaphore = asyncio.Semaphore(3)
     
     async def process_with_semaphore(question: str) -> str:
         async with semaphore:
             return await process_single_question(question)
     
-    # Process questions concurrently but controlled
+    # Process questions concurrently
     tasks = [process_with_semaphore(q) for q in questions]
     answers = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -400,27 +392,37 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "cached_documents": len(document_store),
-        "max_documents": MAX_DOCUMENTS,
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "embedding_method": "gemini_api",
-        "features": ["gemini_embeddings", "gemini_qa", "pdf_processing"]
-    }
+    try:
+        # Test Pinecone connection
+        pinecone_status = "connected"
+        try:
+            index.describe_index_stats()
+        except:
+            pinecone_status = "disconnected"
+            
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "gemini_configured": bool(GEMINI_API_KEY),
+            "pinecone_status": pinecone_status,
+            "pinecone_index": PINECONE_INDEX_NAME,
+            "embedding_method": "gemini_api",
+            "vector_database": "pinecone"
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Health check failed: {str(e)}")
 
 @app.get("/")
 async def root():
     return {
-        "message": "HackRX Document Q&A System (Gemini Embeddings - Ultra Lightweight)",
+        "message": "HackRX Document Q&A System with Pinecone Vector Database",
         "version": "1.0.0",
         "status": "running",
-        "embedding_method": "gemini_api",
-        "advantages": ["ultra_small_image_size", "no_ml_dependencies", "high_accuracy_embeddings"]
+        "features": ["pinecone_storage", "gemini_embeddings", "gemini_qa", "pdf_processing"],
+        "advantages": ["persistent_storage", "fast_retrieval", "scalable", "cost_effective"]
     }
 
-@app.post("/api/v1/hackrx/run", response_model=DocumentResponse)
+@app.post("/hackrx/run", response_model=DocumentResponse)
 async def process_document_qa(
     request: DocumentRequest,
     token: str = Depends(verify_token)
@@ -446,17 +448,72 @@ async def process_document_qa(
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
 
+# Additional endpoint to check document status
+@app.get("/document-status/{doc_hash}")
+async def get_document_status(doc_hash: str, token: str = Depends(verify_token)):
+    try:
+        exists = await check_document_exists_in_pinecone(doc_hash)
+        
+        if exists:
+            # Get document stats from Pinecone
+            query_result = index.query(
+                vector=[0.0] * 768,
+                filter={"document_hash": doc_hash},
+                top_k=100,  # Get more to count total chunks
+                include_metadata=True
+            )
+            
+            chunk_count = len(query_result['matches'])
+            creation_date = None
+            url = None
+            
+            if query_result['matches']:
+                first_match = query_result['matches'][0]
+                if first_match['metadata']:
+                    creation_date = first_match['metadata'].get('created_at')
+                    url = first_match['metadata'].get('url')
+            
+            return {
+                "document_hash": doc_hash,
+                "exists": True,
+                "chunk_count": chunk_count,
+                "created_at": creation_date,
+                "url": url
+            }
+        else:
+            return {
+                "document_hash": doc_hash,
+                "exists": False
+            }
+            
+    except Exception as e:
+        raise HTTPException(500, f"Error checking document status: {str(e)}")
+
+# Endpoint to delete document from Pinecone (optional)
+@app.delete("/document/{doc_hash}")
+async def delete_document(doc_hash: str, token: str = Depends(verify_token)):
+    try:
+        # Delete all vectors for this document
+        index.delete(filter={"document_hash": doc_hash})
+        
+        return {
+            "message": f"Document {doc_hash} deleted successfully",
+            "deleted_at": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error deleting document: {str(e)}")
+
 @app.on_event("startup")
 async def startup():
     logger.info("Application starting up...")
-    logger.info("Using Gemini API for embeddings - ultra lightweight deployment!")
-    logger.info(f"Max documents in cache: {MAX_DOCUMENTS}")
+    logger.info("Using Gemini API for embeddings + Pinecone for storage")
+    logger.info(f"Pinecone index: {PINECONE_INDEX_NAME}")
     logger.info("Startup completed successfully")
 
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Application shutting down...")
-    document_store.clear()
     logger.info("Shutdown completed")
 
 if __name__ == "__main__":
