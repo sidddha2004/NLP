@@ -6,7 +6,7 @@ import aiohttp
 import io
 import json
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -16,8 +16,6 @@ from pydantic import BaseModel, HttpUrl, Field
 
 import PyPDF2
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,15 +34,7 @@ security = HTTPBearer()
 
 # In-memory storage for documents and embeddings
 document_store: Dict[str, Dict] = {}
-
-# Initialize the lightweight sentence transformer model
-try:
-    # Load the lightweight model (only ~90MB)
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-    logger.info("Sentence transformer model loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load sentence transformer: {e}")
-    sentence_model = None
+MAX_DOCUMENTS = 20  # Good balance for memory
 
 # Environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -88,7 +78,7 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     try:
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
         text_parts = []
-        max_pages = min(50, len(pdf_reader.pages))
+        max_pages = min(40, len(pdf_reader.pages))  # Good balance
         
         for page_num in range(max_pages):
             try:
@@ -108,13 +98,13 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         raise HTTPException(400, f"Error extracting text from PDF: {str(e)}")
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
-    """Create optimized chunks for sentence transformer processing"""
+    """Create optimized chunks for Gemini embedding API"""
     words = text.split()
     if len(words) == 0:
         return [text] if text.strip() else []
     
     chunks = []
-    step_size = max(chunk_size - overlap, 100)
+    step_size = max(chunk_size - overlap, 200)
     
     for i in range(0, len(words), step_size):
         chunk_words = words[i:i + chunk_size]
@@ -126,63 +116,122 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
     
     return chunks if chunks else ([text] if text.strip() else [])
 
-def create_embeddings(texts: List[str]) -> np.ndarray:
-    """Create embeddings for text chunks using sentence transformer"""
-    if not sentence_model:
-        raise ValueError("Sentence transformer model not available")
-    
+async def create_gemini_embeddings(texts: List[str]) -> Optional[List[List[float]]]:
+    """Create embeddings using Gemini's embedding API"""
     try:
-        # Process in batches to manage memory
-        batch_size = 32
+        # Process in batches to avoid API limits
+        batch_size = 10  # Gemini embedding API batch limit
         all_embeddings = []
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            # Truncate texts to avoid model limits (all-MiniLM-L6-v2 has 512 token limit)
-            truncated_batch = [text[:2000] for text in batch]  # ~500 tokens approx
             
-            embeddings = sentence_model.encode(
-                truncated_batch, 
-                convert_to_numpy=True,
-                show_progress_bar=False,
-                batch_size=min(len(truncated_batch), 16)  # Small batch size for memory efficiency
-            )
-            all_embeddings.append(embeddings)
+            try:
+                # Use Gemini's embedding model
+                result = await asyncio.to_thread(
+                    genai.embed_content,
+                    model="models/embedding-001",  # Gemini's embedding model
+                    content=batch,
+                    task_type="retrieval_document"  # Optimized for document retrieval
+                )
+                
+                # Extract embeddings from result
+                if hasattr(result, 'embedding'):
+                    # Single embedding
+                    all_embeddings.append(result['embedding'])
+                elif hasattr(result, 'embeddings'):
+                    # Multiple embeddings
+                    all_embeddings.extend(result['embeddings'])
+                else:
+                    # Handle different response formats
+                    batch_embeddings = result if isinstance(result, list) else [result]
+                    all_embeddings.extend(batch_embeddings)
+                
+                # Small delay to respect API limits
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.warning(f"Failed to create embeddings for batch {i//batch_size + 1}: {e}")
+                # Continue with other batches
+                continue
         
-        return np.vstack(all_embeddings)
-    
+        if not all_embeddings:
+            return None
+            
+        logger.info(f"Created {len(all_embeddings)} embeddings using Gemini API")
+        return all_embeddings
+        
     except Exception as e:
-        logger.error(f"Error creating embeddings: {e}")
-        raise ValueError(f"Failed to create embeddings: {str(e)}")
+        logger.error(f"Error creating Gemini embeddings: {e}")
+        return None
 
-async def get_relevant_chunks_semantic(question: str, chunks: List[str], embeddings: np.ndarray, top_k: int = 3) -> List[str]:
-    """Use sentence transformer for semantic similarity instead of Gemini ranking"""
-    if not sentence_model or len(chunks) == 0:
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Calculate cosine similarity between two vectors"""
+    try:
+        # Convert to numpy arrays for easier computation
+        vec_a = np.array(a, dtype=np.float32)
+        vec_b = np.array(b, dtype=np.float32)
+        
+        # Calculate cosine similarity
+        dot_product = np.dot(vec_a, vec_b)
+        norm_a = np.linalg.norm(vec_a)
+        norm_b = np.linalg.norm(vec_b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+            
+        return float(dot_product / (norm_a * norm_b))
+        
+    except Exception as e:
+        logger.error(f"Error calculating cosine similarity: {e}")
+        return 0.0
+
+async def get_relevant_chunks_with_gemini_embeddings(question: str, chunks: List[str], embeddings: List[List[float]], top_k: int = 3) -> List[str]:
+    """Use Gemini embeddings for semantic similarity"""
+    if not embeddings or len(chunks) == 0:
         return chunks[:top_k]
     
     try:
-        # Create embedding for the question
-        question_embedding = sentence_model.encode([question[:2000]], convert_to_numpy=True)
+        # Create embedding for the question using Gemini
+        question_result = await asyncio.to_thread(
+            genai.embed_content,
+            model="models/embedding-001",
+            content=[question],
+            task_type="retrieval_query"  # Optimized for queries
+        )
         
-        # Calculate cosine similarities
-        similarities = cosine_similarity(question_embedding, embeddings)[0]
+        # Extract question embedding
+        if hasattr(question_result, 'embedding'):
+            question_embedding = question_result.embedding
+        elif hasattr(question_result, 'embeddings'):
+            question_embedding = question_result.embeddings[0]
+        else:
+            question_embedding = question_result[0] if isinstance(question_result, list) else question_result
         
-        # Get top_k most similar chunks
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        # Calculate similarities with all chunk embeddings
+        similarities = []
+        for i, chunk_embedding in enumerate(embeddings):
+            if i < len(chunks):  # Ensure we don't go out of bounds
+                similarity = cosine_similarity(question_embedding, chunk_embedding)
+                similarities.append((similarity, i))
         
-        # Return the most relevant chunks
+        # Sort by similarity and get top chunks
+        similarities.sort(reverse=True, key=lambda x: x[0])
+        top_indices = [idx for _, idx in similarities[:top_k]]
+        
         relevant_chunks = [chunks[i] for i in top_indices if i < len(chunks)]
+        similarity_scores = [score for score, _ in similarities[:len(relevant_chunks)]]
         
-        logger.info(f"Selected {len(relevant_chunks)} relevant chunks with similarities: {similarities[top_indices][:len(relevant_chunks)]}")
+        logger.info(f"Selected {len(relevant_chunks)} relevant chunks with Gemini embeddings, similarities: {similarity_scores}")
         return relevant_chunks
         
     except Exception as e:
-        logger.error(f"Error in semantic similarity search: {e}")
-        # Fallback to first chunks
-        return chunks[:top_k]
+        logger.error(f"Error in Gemini embedding similarity search: {e}")
+        # Fallback to keyword-based matching
+        return await get_relevant_chunks_keyword_fallback(question, chunks, top_k)
 
-async def get_relevant_chunks_fallback(question: str, chunks: List[str], top_k: int = 3) -> List[str]:
-    """Fallback method using Gemini for chunk selection when sentence transformer fails"""
+async def get_relevant_chunks_keyword_fallback(question: str, chunks: List[str], top_k: int = 3) -> List[str]:
+    """Fallback method using keyword matching"""
     if not chunks:
         return []
     
@@ -190,47 +239,36 @@ async def get_relevant_chunks_fallback(question: str, chunks: List[str], top_k: 
         return chunks
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Simple but effective keyword-based relevance scoring
+        question_words = set(word.lower().strip('.,!?":;()[]{}') for word in question.split() if len(word) > 2)
+        chunk_scores = []
         
-        # Limit chunks to prevent token overflow
-        limited_chunks = chunks[:12]
-        
-        chunks_text = ""
-        for i, chunk in enumerate(limited_chunks):
-            chunks_text += f"CHUNK {i+1}:\n{chunk[:600]}\n\n---\n\n"
-        
-        prompt = f"""Question: "{question}"
-
-Below are text chunks. Rate each chunk's relevance to answering the question (1-10).
-Return ONLY the numbers of the {top_k} most relevant chunks, comma-separated.
-
-{chunks_text}
-
-Response format: "1,3,7" (just the numbers)"""
-
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=50,
-                    temperature=0.1
-                )
-            ),
-            timeout=20.0
-        )
-        
-        # Parse response
-        try:
-            chunk_indices = [int(x.strip()) - 1 for x in response.text.strip().split(',')]
-            relevant_chunks = [limited_chunks[i] for i in chunk_indices if 0 <= i < len(limited_chunks)]
-            return relevant_chunks[:top_k] if relevant_chunks else chunks[:top_k]
-        except (ValueError, IndexError) as e:
-            logger.warning(f"Failed to parse chunk selection: {e}")
-            return chunks[:top_k]
+        for i, chunk in enumerate(chunks):
+            chunk_words = set(word.lower().strip('.,!?":;()[]{}') for word in chunk.split() if len(word) > 2)
             
+            # Calculate relevance score
+            common_words = question_words.intersection(chunk_words)
+            score = len(common_words)
+            
+            # Boost score for exact phrase matches
+            question_lower = question.lower()
+            chunk_lower = chunk.lower()
+            for word in question_words:
+                if word in chunk_lower:
+                    score += 0.5
+            
+            chunk_scores.append((score, i))
+        
+        # Sort by score and return top chunks
+        chunk_scores.sort(reverse=True, key=lambda x: x[0])
+        relevant_indices = [idx for _, idx in chunk_scores[:top_k]]
+        relevant_chunks = [chunks[i] for i in relevant_indices]
+        
+        logger.info(f"Selected {len(relevant_chunks)} relevant chunks using keyword fallback")
+        return relevant_chunks
+        
     except Exception as e:
-        logger.error(f"Error in fallback chunk selection: {e}")
+        logger.error(f"Error in keyword fallback: {e}")
         return chunks[:top_k]
 
 async def generate_answer(question: str, context: str) -> str:
@@ -238,7 +276,7 @@ async def generate_answer(question: str, context: str) -> str:
         model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Limit context length
-        limited_context = context[:4000] if len(context) > 4000 else context
+        limited_context = context[:4500] if len(context) > 4500 else context
         
         prompt = f"""Based on the provided context, answer the question concisely and accurately. If the context doesn't contain enough information to answer the question, say so.
 
@@ -254,7 +292,7 @@ Answer:"""
                 model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=500,
+                    max_output_tokens=400,
                     temperature=0.2,
                     top_p=0.8,
                 )
@@ -274,6 +312,13 @@ Answer:"""
 async def process_document_and_questions(url: str, questions: List[str]) -> List[str]:
     doc_hash = generate_document_hash(str(url))
     
+    # Clean up old documents if we're at capacity
+    if len(document_store) >= MAX_DOCUMENTS and doc_hash not in document_store:
+        # Remove oldest document
+        oldest_doc = min(document_store.items(), key=lambda x: x[1]['processed_at'])
+        del document_store[oldest_doc[0]]
+        logger.info(f"Removed oldest document to free memory")
+    
     # Check if document is already processed
     if doc_hash not in document_store:
         logger.info(f"Processing new document: {doc_hash}")
@@ -285,15 +330,11 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             if not chunks:
                 raise HTTPException(400, "No text chunks could be created from the PDF")
             
-            # Create embeddings if sentence transformer is available
-            embeddings = None
-            if sentence_model:
-                try:
-                    embeddings = await asyncio.to_thread(create_embeddings, chunks)
-                    logger.info(f"Created embeddings for {len(chunks)} chunks")
-                except Exception as e:
-                    logger.warning(f"Failed to create embeddings, will use fallback: {e}")
-                    embeddings = None
+            # Limit number of chunks to manage API usage
+            chunks = chunks[:60]  # Reasonable limit
+            
+            # Create embeddings using Gemini API
+            embeddings = await create_gemini_embeddings(chunks)
             
             # Store in memory
             document_store[doc_hash] = {
@@ -302,7 +343,9 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
                 'url': str(url),
                 'processed_at': datetime.utcnow().isoformat()
             }
-            logger.info(f"Document processed successfully. Chunks: {len(chunks)}")
+            
+            embed_status = "with Gemini embeddings" if embeddings else "without embeddings (will use keyword matching)"
+            logger.info(f"Document processed successfully. Chunks: {len(chunks)} {embed_status}")
             
         except Exception as e:
             logger.error(f"Error processing document: {e}")
@@ -316,11 +359,11 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
     
     async def process_single_question(question: str) -> str:
         try:
-            # Try semantic similarity first, fallback to Gemini-based selection
-            if embeddings is not None and sentence_model:
-                relevant_chunks = await get_relevant_chunks_semantic(question, chunks, embeddings, top_k=3)
+            # Try Gemini embeddings first, fallback to keyword matching
+            if embeddings:
+                relevant_chunks = await get_relevant_chunks_with_gemini_embeddings(question, chunks, embeddings, top_k=3)
             else:
-                relevant_chunks = await get_relevant_chunks_fallback(question, chunks, top_k=3)
+                relevant_chunks = await get_relevant_chunks_keyword_fallback(question, chunks, top_k=3)
             
             if not relevant_chunks:
                 return "No relevant information found in the document."
@@ -333,23 +376,27 @@ async def process_document_and_questions(url: str, questions: List[str]) -> List
             logger.error(f"Error processing question '{question}': {e}")
             return "An error occurred while processing this question."
     
-    # Process questions with limited concurrency
-    semaphore = asyncio.Semaphore(2)
+    # Process questions with controlled concurrency
+    semaphore = asyncio.Semaphore(3)  # Allow 3 concurrent questions
     
     async def process_with_semaphore(question: str) -> str:
         async with semaphore:
             return await process_single_question(question)
     
-    answers = []
-    for question in questions:
-        try:
-            answer = await process_with_semaphore(question)
-            answers.append(answer)
-        except Exception as e:
-            logger.error(f"Error processing question: {e}")
-            answers.append("An error occurred while processing this question.")
+    # Process questions concurrently but controlled
+    tasks = [process_with_semaphore(q) for q in questions]
+    answers = await asyncio.gather(*tasks, return_exceptions=True)
     
-    return answers
+    # Handle any exceptions in the results
+    final_answers = []
+    for answer in answers:
+        if isinstance(answer, Exception):
+            logger.error(f"Error in question processing: {answer}")
+            final_answers.append("An error occurred while processing this question.")
+        else:
+            final_answers.append(answer)
+    
+    return final_answers
 
 @app.get("/health")
 async def health_check():
@@ -357,18 +404,20 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "cached_documents": len(document_store),
+        "max_documents": MAX_DOCUMENTS,
         "gemini_configured": bool(GEMINI_API_KEY),
-        "sentence_transformer_available": sentence_model is not None,
-        "model_info": "all-MiniLM-L6-v2" if sentence_model else "not_loaded"
+        "embedding_method": "gemini_api",
+        "features": ["gemini_embeddings", "gemini_qa", "pdf_processing"]
     }
 
 @app.get("/")
 async def root():
     return {
-        "message": "HackRX Document Q&A System (Optimized with Sentence Transformers)",
+        "message": "HackRX Document Q&A System (Gemini Embeddings - Ultra Lightweight)",
         "version": "1.0.0",
         "status": "running",
-        "features": ["semantic_similarity", "gemini_qa", "pdf_processing"]
+        "embedding_method": "gemini_api",
+        "advantages": ["ultra_small_image_size", "no_ml_dependencies", "high_accuracy_embeddings"]
     }
 
 @app.post("/api/v1/hackrx/run", response_model=DocumentResponse)
@@ -397,27 +446,11 @@ async def process_document_qa(
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(500, f"An unexpected error occurred: {str(e)}")
 
-# Memory-efficient cleanup
-async def cleanup_old_documents():
-    while True:
-        try:
-            await asyncio.sleep(3600)  # Clean up every hour
-            if len(document_store) > 30:  # Reduced limit to manage memory better
-                sorted_docs = sorted(
-                    document_store.items(), 
-                    key=lambda x: x[1]['processed_at']
-                )
-                for doc_id, _ in sorted_docs[:-15]:  # Keep only 15 most recent
-                    del document_store[doc_id]
-                logger.info(f"Cleaned up old documents. Current count: {len(document_store)}")
-        except Exception as e:
-            logger.error(f"Error in cleanup task: {e}")
-
 @app.on_event("startup")
 async def startup():
     logger.info("Application starting up...")
-    logger.info(f"Sentence transformer model status: {'Loaded' if sentence_model else 'Failed to load'}")
-    asyncio.create_task(cleanup_old_documents())
+    logger.info("Using Gemini API for embeddings - ultra lightweight deployment!")
+    logger.info(f"Max documents in cache: {MAX_DOCUMENTS}")
     logger.info("Startup completed successfully")
 
 @app.on_event("shutdown")
