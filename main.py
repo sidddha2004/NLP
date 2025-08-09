@@ -400,7 +400,7 @@ async def create_gemini_embedding(text: str, task_type: str = "retrieval_documen
             
             result = await asyncio.to_thread(
                 genai.embed_content,
-                model="models/embedding-001",
+                model="models/text-embedding-004",  # Updated to use correct Gemini embedding model
                 content=text,
                 task_type=task_type
             )
